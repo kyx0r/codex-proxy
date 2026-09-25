@@ -406,7 +406,7 @@ static int login(void)
 		cJSON_Delete(auth); return 1;
 	}
 	cJSON_Delete(auth);
-	fputs("Login saved.\n", stderr);
+	fprintf(stderr, "Login saved to %s\n", auth_file);
 	return 0;
 }
 
