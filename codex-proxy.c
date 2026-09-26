@@ -554,10 +554,18 @@ static cJSON *sse_response(char *body)
 				else cJSON_InsertItemInArray(items, position, cJSON_Duplicate(event, 1));
 			} else if (!strcmp(field(event, "type"), "response.completed")) {
 				cJSON_Delete(response); response = cJSON_Duplicate(get(event, "response"), 1);
-			} else if (!strcmp(field(event, "type"), "response.failed") ||
-					!strcmp(field(event, "type"), "response.incomplete") ||
-					!strcmp(field(event, "type"), "error")) {
-				cJSON_Delete(event); error = "upstream response failed or was incomplete"; goto fail;
+			} else if (!strcmp(field(event, "type"), "response.failed")) {
+				cJSON_Delete(event);
+				error = "upstream response failed";
+				goto fail;
+			} else if (!strcmp(field(event, "type"), "response.incomplete")) {
+				cJSON_Delete(event);
+				error = "upstream response incomplete";
+				goto fail;
+			} else if (!strcmp(field(event, "type"), "error")) {
+				cJSON_Delete(event);
+				error = "upstream response error";
+				goto fail;
 			}
 			cJSON_Delete(event); free(data.s); data = (struct buf){0};
 		}
