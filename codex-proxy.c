@@ -517,6 +517,48 @@ fail:
 	return NULL;
 }
 
+/* Diagnostics are opt-in: upstream messages can contain private request data.
+ * Enable only with access-controlled stderr: CODEX_PROXY_DEBUG_ERRORS=1.
+ * Bound and escape each value to prevent multiline/terminal log injection.
+ */
+static void diagnostic_value(char *out, size_t size, const char *value)
+{
+	static const char hex[] = "0123456789abcdef";
+	size_t n = 0;
+	const unsigned char *p = (const unsigned char *)value;
+	while (*p && n + 7 < size) {
+		unsigned char c = *p++;
+		if (c == '"' || c == '\\') {
+			out[n++] = '\\'; out[n++] = (char)c;
+		} else if (c < 32 || c >= 127) {
+			out[n++] = '\\'; out[n++] = 'x';
+			out[n++] = hex[c >> 4]; out[n++] = hex[c & 15];
+		} else out[n++] = (char)c;
+	}
+	if (*p) { out[n++] = '.'; out[n++] = '.'; out[n++] = '.'; }
+	out[n] = 0;
+}
+
+static void log_upstream_event(cJSON *event, const char *summary)
+{
+	const char *debug = getenv("CODEX_PROXY_DEBUG_ERRORS");
+	cJSON *response = get(event, "response"), *detail = get(response, "error");
+	char code[96], message[512], param[96], reason[96];
+	if (!debug || strcmp(debug, "1")) {
+		fprintf(stderr, "%s (set CODEX_PROXY_DEBUG_ERRORS=1 for details; "
+			"diagnostics may contain sensitive data)\n", summary);
+		return;
+	}
+	if (!cJSON_IsObject(detail)) detail = get(event, "error");
+	if (!cJSON_IsObject(detail)) detail = event;
+	diagnostic_value(code, sizeof(code), field(detail, "code"));
+	diagnostic_value(message, sizeof(message), field(detail, "message"));
+	diagnostic_value(param, sizeof(param), field(detail, "param"));
+	diagnostic_value(reason, sizeof(reason), field(get(response, "incomplete_details"), "reason"));
+	fprintf(stderr, "%s: code=\"%s\" message=\"%s\" param=\"%s\" reason=\"%s\"\n",
+		summary, code, message, param, reason);
+}
+
 static cJSON *sse_response(char *body)
 {
 	char *line = body, *end;
@@ -555,16 +597,19 @@ static cJSON *sse_response(char *body)
 			} else if (!strcmp(field(event, "type"), "response.completed")) {
 				cJSON_Delete(response); response = cJSON_Duplicate(get(event, "response"), 1);
 			} else if (!strcmp(field(event, "type"), "response.failed")) {
-				cJSON_Delete(event);
 				error = "upstream response failed";
+				log_upstream_event(event, error);
+				cJSON_Delete(event);
 				goto fail;
 			} else if (!strcmp(field(event, "type"), "response.incomplete")) {
-				cJSON_Delete(event);
 				error = "upstream response incomplete";
+				log_upstream_event(event, error);
+				cJSON_Delete(event);
 				goto fail;
 			} else if (!strcmp(field(event, "type"), "error")) {
-				cJSON_Delete(event);
 				error = "upstream response error";
+				log_upstream_event(event, error);
+				cJSON_Delete(event);
 				goto fail;
 			}
 			cJSON_Delete(event); free(data.s); data = (struct buf){0};
