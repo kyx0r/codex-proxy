@@ -1169,7 +1169,8 @@ static void usage(void)
 	      "  --auth-file PATH    Credentials (default: $HOME/.codex-proxy.json)\n"
 	      "  --model MODEL       Default model for requests without model\n"
 	      "  --reasoning-effort LEVEL  Default effort; requests can override it\n"
-	      "  --port PORT         Loopback listener (default: 8080)\n"
+	      "  --port PORT         Listener port (default: 8080)\n"
+	      "  --host IPv4         Listener address (default: 127.0.0.1)\n"
 	      "  --timeout SECONDS   Upstream timeout (default: 300)\n"
 	      "  --upstream URL     Responses endpoint override\n"
 	      "  --auth-base URL    Authentication service override\n"
@@ -1182,9 +1183,11 @@ int main(int argc, char **argv)
 	long value;
 	char *end;
 	const char *home = getenv("HOME"), *key = getenv("CODEX_PROXY_KEY");
+	const char *bind_ip = "127.0.0.1";
 	struct buf default_path = {0};
 	struct sockaddr_in addr;
 	struct sigaction sa;
+	struct in_addr bind_addr;
 	cJSON *auth;
 	cJSON_Hooks hooks = {allocate, free};
 	cJSON_InitHooks(&hooks);
@@ -1218,6 +1221,8 @@ int main(int argc, char **argv)
 			upstream = argv[i + 1];
 		else if (!strcmp(argv[i], "--auth-base"))
 			auth_base = argv[i + 1];
+		else if (!strcmp(argv[i], "--host"))
+			bind_ip = argv[i + 1];
 		else if (!strcmp(argv[i], "--port") || !strcmp(argv[i], "--timeout")) {
 			errno = 0;
 			value = strtol(argv[i + 1], &end, 10);
@@ -1233,6 +1238,10 @@ int main(int argc, char **argv)
 			usage();
 			return 1;
 		}
+	}
+	if (inet_pton(AF_INET, bind_ip, &bind_addr) != 1) {
+		fprintf(stderr, "invalid --host IPv4 address: %s\n", bind_ip);
+		return 1;
 	}
 	if (!auth_file || !*auth_file || !valid_url(upstream) || !valid_url(auth_base)
 	    || strpbrk(local_key, "\r\n")) {
@@ -1268,14 +1277,14 @@ int main(int argc, char **argv)
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons((unsigned short)port);
-	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_addr = bind_addr;
 	if (server < 0
 	    || setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) ||
 	    bind(server, (struct sockaddr *)&addr, sizeof(addr)) || listen(server, 8)) {
 		perror("listen");
 		result = 1;
 	} else {
-		fprintf(stderr, "Listening on http://127.0.0.1:%d\n", port);
+		fprintf(stderr, "Listening on http://%s:%d\n", bind_ip, port);
 		while (!stopped) {
 			fd = accept(server, NULL, NULL);
 			if (fd < 0) {

@@ -55,10 +55,18 @@ another file; its parent directory must already exist. A sibling `.lock` file
 prevents concurrent login/serve processes from rotating the same credentials.
 Stop the server before logging in again.
 
-The server listens only on `127.0.0.1:8080`. Its default local bearer key is
-`local`, matching Nextvi's existing LOCAL configuration. To choose a private
-local key, set `CODEX_PROXY_KEY` in the server environment and configure the
-same key in Nextvi. This local key is unrelated to the subscription tokens.
+The server listens on `127.0.0.1:8080` by default. Use `--host IPv4` to bind
+another IPv4 address (or `0.0.0.0` for all IPv4 interfaces) and `--port PORT`
+to choose a port, for example:
+
+```sh
+CODEX_PROXY_KEY=your-secret-key ./codex-proxy serve --host 192.168.1.10 --port 8080
+```
+
+The default bearer key is `local`, matching Nextvi's existing LOCAL configuration.
+If exposing the server to other machines, set a strong `CODEX_PROXY_KEY` and
+configure the same key in clients. HTTP traffic is unencrypted; use a trusted
+network or a TLS reverse proxy. This key is unrelated to subscription tokens.
 
 Nextvi's current configuration already matches:
 
@@ -67,6 +75,9 @@ static char *api_key = "local";
 static char *endpoint = "http://127.0.0.1:8080/v1/chat/completions";
 static char *request_extra = "{}";
 ```
+
+For remote clients, set their endpoint to `http://<server-ip>:8080/v1/chat/completions`
+and use the configured bearer key.
 
 `--model` supplies the model when the HTTP request omits it.
 `--reasoning-effort` supplies the effort when the request omits `reasoning_effort`.
