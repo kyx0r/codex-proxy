@@ -1048,9 +1048,7 @@ static void serve_client(int fd, cJSON **auth)
 			expect_continue = 1;
 		}
 	}
-	if (!host || !local_host(host)) {
-		status = 403;
-		error = "Host must be localhost or 127.0.0.1";
+	if (!host || !*host) {
 		goto bad;
 	}
 	if (!strcmp(method, "GET") && !strcmp(path, "/health")) {
