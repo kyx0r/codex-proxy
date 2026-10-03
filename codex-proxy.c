@@ -97,8 +97,7 @@ static cJSON *failure(const char *message)
 
 static void onsignal(int sig)
 {
-	(void)sig;
-	stopped = 1;
+	stopped = sig;
 }
 
 static long long milliseconds(void)
@@ -1304,5 +1303,7 @@ done:
 	close(lockfd);
 	curl_global_cleanup();
 	free(default_path.s);
+	if (stopped == SIGINT && isatty(STDERR_FILENO))
+		fputc('\n', stderr);
 	return result;
 }
