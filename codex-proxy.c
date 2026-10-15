@@ -44,6 +44,8 @@ static const char *anthropic_scopes = "org:create_api_key user:profile user:infe
 static const char *anthropic_beta = "oauth-2025-04-20,token-efficient-tools-2025-02-19";
 static char anthropic_redirect[64];
 static int code_port = 54222;
+static const char *anthropic_upstream = "https://api.anthropic.com/v1/messages";
+static long thinking_budget;
 static int manual_code;
 
 struct sha256 {
@@ -320,6 +322,25 @@ static cJSON *failure(const char *message)
 	cJSON_AddStringToObject(e, "type", "proxy_error");
 	return j;
 }
+static void reply(int fd, int status, cJSON *j);
+static void reply_invalid(int fd, const char *message)
+{
+	cJSON *j, *e;
+
+	if (strcmp(backend, "anthropic")) {
+		reply(fd, 400, failure(message));
+		return;
+	}
+	j = cJSON_CreateObject();
+	e = cJSON_AddObjectToObject(j, "error");
+	cJSON_AddStringToObject(j, "type", "error");
+	if (e) {
+		cJSON_AddStringToObject(e, "type", "invalid_request_error");
+		cJSON_AddStringToObject(e, "message", message);
+	}
+	reply(fd, 400, j);
+}
+
 
 static void onsignal(int sig)
 {
@@ -489,6 +510,155 @@ static int post(const char *url, const char *body, const char *type,
 	curl_easy_cleanup(curl);
 	curl_slist_free_all(headers);
 	return code == CURLE_OK ? 0 : -1;
+}
+
+static int refresh(cJSON **auth);
+static const char *reason(long status)
+{
+	switch (status) {
+	case 200:
+		return "OK";
+	case 400:
+		return "Bad Request";
+	case 401:
+		return "Unauthorized";
+	case 403:
+		return "Forbidden";
+	case 404:
+		return "Not Found";
+	case 413:
+		return "Content Too Large";
+	case 429:
+		return "Too Many Requests";
+	case 500:
+		return "Internal Server Error";
+	case 502:
+		return "Bad Gateway";
+	case 529:
+		return "Overloaded";
+	default:
+		return "Error";
+	}
+}
+
+static void raw_reply(int fd, long status, const char *type,
+		      const char *body, size_t n)
+{
+	char header[256];
+	int len = snprintf(header, sizeof(header),
+			   "HTTP/1.1 %ld %s\r\nContent-Type: %s\r\n"
+			   "Content-Length: %zu\r\nConnection: close\r\n"
+			   "Cache-Control: no-store\r\n\r\n", status, reason(status),
+			   type, n);
+
+	if (len <= 0 || (size_t)len >= sizeof(header))
+		return;
+	if (!sendall(fd, header, (size_t)len))
+		sendall(fd, body, n);
+}
+
+static long effort_budget(const char *effort)
+{
+	if (!effort)
+		return 0;
+	if (!strcasecmp(effort, "minimal") || !strcasecmp(effort, "low"))
+		return 1024;
+	if (!strcasecmp(effort, "medium"))
+		return 8000;
+	if (!strcasecmp(effort, "high"))
+		return 16000;
+	return 0;
+}
+
+static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **auth)
+{
+	struct buf body = {0};
+	char url[512], *encoded;
+	double number;
+	long budget = thinking_budget, status = 0;
+	int rc, attempt, stream;
+	cJSON *item;
+
+	if (!cJSON_IsObject(chat)) {
+		reply_invalid(fd, "request body must be a JSON object");
+		return;
+	}
+	if (!get(chat, "model")) {
+		if (!model) {
+			reply_invalid(fd, "model required; pass --model or send one");
+			return;
+		}
+		cJSON_AddStringToObject(chat, "model", model);
+	}
+	item = get(chat, "max_tokens");
+	if (!item && !strcmp(path, "/v1/messages")) {
+		reply_invalid(fd, "max_tokens required");
+		return;
+	}
+	if (item && !cJSON_IsNumber(item)) {
+		reply_invalid(fd, "max_tokens must be a number");
+		return;
+	}
+	if (item && !strcmp(path, "/v1/messages/count_tokens"))
+		cJSON_DeleteItemFromObject(chat, "max_tokens");
+	number = item ? cJSON_GetNumberValue(item) : 0;
+	stream = cJSON_IsTrue(get(chat, "stream"));
+	if (!budget)
+		budget = effort_budget(reasoning_effort);
+	if (budget && number && number <= (double)budget + 1024)
+		budget = number > 2048 ? (long)(number - 1024) : 0;
+	if (budget >= 1024 && !strcmp(path, "/v1/messages")
+	    && !get(chat, "thinking")) {
+		item = cJSON_AddObjectToObject(chat, "thinking");
+		if (item) {
+			cJSON_AddStringToObject(item, "type", "enabled");
+			cJSON_AddNumberToObject(item, "budget_tokens", (double)budget);
+		}
+	}
+	encoded = cJSON_PrintUnformatted(chat);
+	if (!encoded) {
+		reply(fd, 500, failure("cannot encode request"));
+		return;
+	}
+	number = 0;
+	item = get(*auth, "expires_at");
+	if (item)
+		number = cJSON_GetNumberValue(item);
+	if (number > 0 && number < (double)time(NULL) + 60 && refresh(auth)) {
+		free(encoded);
+		reply(fd, 401, failure("subscription refresh failed; stop the server and"
+		      " run login"));
+		return;
+	}
+	snprintf(url, sizeof(url), "%s%s", anthropic_upstream,
+		 strcmp(path, "/v1/messages") ? "/count_tokens" : "");
+	for (attempt = 0; attempt < 2; attempt++) {
+		rc = post(url, encoded, "application/json", *auth, &body, &status, fd);
+		if (rc || status != 401 || attempt || refresh(auth))
+			break;
+		free(body.s);
+		body = (struct buf) {
+			0
+		};
+	}
+	free(encoded);
+	if (rc) {
+		free(body.s);
+		reply(fd, 502, failure(error_text));
+		return;
+	}
+	if (!body.s || !body.n) {
+		free(body.s);
+		snprintf(error_text, sizeof(error_text),
+			 "inference backend returned HTTP %ld with no body", status);
+		reply(fd, status >= 400 && status <= 599 ? (int)status : 502,
+		      failure(error_text));
+		return;
+	}
+	raw_reply(fd, status,
+		  status == 200 && stream ? "text/event-stream" : "application/json",
+		  body.s, body.n);
+	free(body.s);
 }
 
 static cJSON *auth_post(const char *path, cJSON *j, int form, long *status)
@@ -1519,6 +1689,7 @@ static void serve_client(int fd, cJSON **auth)
 	size_t header_size, length = 0;
 	ssize_t n;
 	int have_length = 0, expect_continue = 0, status = 400;
+	int anthropic_api = !strcmp(backend, "anthropic");
 	long long deadline = milliseconds() + 15000;
 	const char *error = "invalid HTTP request";
 	cJSON *j;
@@ -1621,7 +1792,8 @@ static void serve_client(int fd, cJSON **auth)
 		reply(fd, 200, j);
 		goto done;
 	}
-	if (strcmp(path, "/v1/chat/completions")) {
+	if (strcmp(path, "/v1/chat/completions")
+	    && !(anthropic_api && !strncmp(path, "/v1/messages", 12))) {
 		status = 404;
 		error = "unknown endpoint";
 		goto bad;
@@ -1659,7 +1831,10 @@ static void serve_client(int fd, cJSON **auth)
 	j = cJSON_ParseWithOpts(b.s + header_size, NULL, 1);
 	if (!j)
 		goto bad;
-	complete(fd, j, auth);
+	if (anthropic_api)
+		complete_anthropic(fd, path, j, auth);
+	else
+		complete(fd, j, auth);
 	cJSON_Delete(j);
 	goto done;
 bad:
@@ -1722,6 +1897,8 @@ static void usage(void)
 	      "  --code-port PORT    Login redirect port for Anthropic login (54222)\n"
 	      "  --manual            Anthropic login without a loopback listener\n"
 	      "  --auth-base URL    Authentication service override\n"
+	      "  --thinking-budget N   Anthropic thinking budget (1024-512000)\n"
+	      "  --upstream-anthropic URL Anthropic Messages endpoint override\n"
 	      "CODEX_PROXY_KEY sets the local HTTP key (default: local).\n", stderr);
 }
 
@@ -1780,12 +1957,23 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			backend = argv[i + 1];
-		} else if (!strcmp(argv[i], "--token-url"))
+		} else if (!strcmp(argv[i], "--upstream-anthropic"))
+			anthropic_upstream = argv[i + 1];
+		else if (!strcmp(argv[i], "--token-url"))
 			anthropic_token_url = argv[i + 1];
 		else if (!strcmp(argv[i], "--authorize-url"))
 			anthropic_authorize = argv[i + 1];
 		else if (!strcmp(argv[i], "--host"))
 			bind_ip = argv[i + 1];
+		else if (!strcmp(argv[i], "--thinking-budget")) {
+			errno = 0;
+			value = strtol(argv[i + 1], &end, 10);
+			if (errno || *end || value < 1024 || value > 512000) {
+				usage();
+				return 1;
+			}
+			thinking_budget = value;
+		}
 		else if (!strcmp(argv[i], "--port") || !strcmp(argv[i], "--timeout")
 			   || !strcmp(argv[i], "--code-port")) {
 			errno = 0;
@@ -1819,6 +2007,7 @@ int main(int argc, char **argv)
 	}
 	if (!auth_file || !*auth_file || !valid_url(upstream) || !valid_url(auth_base)
 	    || !valid_url(anthropic_token_url) || !valid_url(anthropic_authorize)
+	    || !valid_url(anthropic_upstream)
 	    || strpbrk(local_key, "\r\n")) {
 		fputs("invalid path, key, or URL (HTTPS or loopback HTTP required)\n", stderr);
 		return 1;
@@ -1840,11 +2029,6 @@ int main(int argc, char **argv)
 		return 1;
 	if (!strcmp(argv[1], "login")) {
 		result = strcmp(backend, "anthropic") ? login() : anthropic_login();
-		goto done;
-	}
-	if (!strcmp(backend, "anthropic")) {
-		fputs("serve: only Anthropic login is implemented so far\n", stderr);
-		result = 1;
 		goto done;
 	}
 	auth = load_auth();
