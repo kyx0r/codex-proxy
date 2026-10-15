@@ -139,6 +139,8 @@ instead of translating Chat Completions:
 - `POST /v1/messages` and `POST /v1/messages/count_tokens` are relayed verbatim:
   upstream status and body are returned unchanged, `"stream": true` is passed
   through as `text/event-stream`, and upstream errors keep their own shape.
+- Query strings such as `?beta=true` are ignored; any other
+  `/v1/messages` sub-path returns HTTP 404.
 - `max_tokens` is required for `/v1/messages`; it is read but not forwarded for
   `count_tokens`.
 - `--model` supplies a missing model. `--reasoning-effort` (`minimal` and `low`
