@@ -143,6 +143,10 @@ instead of translating Chat Completions:
   `/v1/messages` sub-path returns HTTP 404.
 - `max_tokens` is required for `/v1/messages`; it is read but not forwarded for
   `count_tokens`.
+- `tools` entries in Chat Completions form (`{"type":"function","function":{...}}`)
+  are rewritten to the Messages form before relaying: `name` and `description`
+  move out, and `parameters` (or an existing `input_schema`) becomes
+  `input_schema`. Tools already in Messages form are left alone.
 - `--model` supplies a missing model. `--reasoning-effort` (`minimal` and `low`
   mean a 1024 token budget, `medium` 8000, `high` 16000) or `--thinking-budget N`
   injects extended thinking when the request has none. The budget is clamped to
