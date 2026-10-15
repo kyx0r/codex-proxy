@@ -590,12 +590,13 @@ static void openai_tool(cJSON *tool, const char *key, const char *name)
 
 static void openai_tools(cJSON *chat)
 {
-	cJSON *tools = get(chat, "tools");
-	cJSON *tool;
+	cJSON *tools = get(chat, "tools"), *tool, *item;
 
 	if (!cJSON_IsArray(tools))
 		return;
 	cJSON_ArrayForEach(tool, tools) {
+		if (!cJSON_IsObject(tool))
+			continue;
 		if (!strcasecmp(field(tool, "type"), "function")
 		    && cJSON_IsObject(get(tool, "function"))) {
 			openai_tool(tool, "name", "name");
@@ -605,23 +606,376 @@ static void openai_tools(cJSON *chat)
 			cJSON_DeleteItemFromObject(tool, "function");
 			cJSON_DeleteItemFromObject(tool, "type");
 		}
+		if (!get(tool, "type") && !get(tool, "input_schema")
+		    && cJSON_IsString(get(tool, "name"))) {
+			item = cJSON_AddObjectToObject(tool, "input_schema");
+			if (item)
+				cJSON_AddStringToObject(item, "type", "object");
+		}
 	}
 }
 
+/* The Messages gateway rejects fields that Chat Completions clients send. */
+static void openai_choice(cJSON *chat)
+{
+	cJSON *item = get(chat, "tool_choice"), *fn, *name, *pick;
+	const char *mode;
+
+	if (!item)
+		return;
+	if (cJSON_IsObject(item)) {
+		fn = get(item, "function");
+		name = fn ? get(fn, "name") : NULL;
+		if (strcasecmp(field(item, "type"), "function")
+		    || !cJSON_IsString(name))
+			return;
+		pick = cJSON_CreateObject();
+		if (pick) {
+			cJSON_AddStringToObject(pick, "type", "tool");
+			cJSON_AddStringToObject(pick, "name", name->valuestring);
+			cJSON_ReplaceItemInObject(chat, "tool_choice", pick);
+		}
+		return;
+	}
+	if (!cJSON_IsString(item)) {
+		cJSON_DeleteItemFromObject(chat, "tool_choice");
+		return;
+	}
+	mode = item->valuestring;
+	if (!strcasecmp(mode, "none") || !strcasecmp(mode, "required")) {
+		pick = cJSON_CreateObject();
+		if (pick) {
+			cJSON_AddStringToObject(pick, "type",
+			    strcasecmp(mode, "none") ? "any" : "none");
+			cJSON_ReplaceItemInObject(chat, "tool_choice", pick);
+		}
+		return;
+	}
+	cJSON_DeleteItemFromObject(chat, "tool_choice");
+}
+/*
+ * Chat keeps tool calls on assistant messages and tool answers in
+ * role "tool"; Messages wants tool_use blocks and tool_result blocks.
+ */
+static void openai_message(cJSON *message)
+{
+	cJSON *calls = cJSON_DetachItemFromObject(message, "tool_calls");
+	cJSON *call, *content, *blocks, *block, *fn, *item, *parsed;
+
+	if (!cJSON_IsArray(calls)) {
+		cJSON_Delete(calls);
+		return;
+	}
+	content = get(message, "content");
+	blocks = cJSON_IsArray(content) ? content : NULL;
+	if (!blocks) {
+		blocks = cJSON_CreateArray();
+		if (!blocks) {
+			cJSON_Delete(calls);
+			return;
+		}
+		if (cJSON_IsString(content)) {
+			item = cJSON_CreateObject();
+			if (item) {
+				cJSON_AddStringToObject(item, "type", "text");
+				cJSON_AddStringToObject(item, "text",
+				    content->valuestring);
+				cJSON_AddItemToArray(blocks, item);
+			}
+}
+		cJSON_ReplaceItemInObject(message, "content", blocks);
+	}
+	cJSON_ArrayForEach(call, calls) {
+		fn = get(call, "function");
+		if (!cJSON_IsObject(fn))
+			continue;
+		block = cJSON_CreateObject();
+		if (!block)
+			break;
+		cJSON_AddStringToObject(block, "type", "tool_use");
+		item = get(call, "id");
+		if (cJSON_IsString(item))
+			cJSON_AddStringToObject(block, "id", item->valuestring);
+		item = get(fn, "name");
+		cJSON_AddStringToObject(block, "name",
+		    cJSON_IsString(item) ? item->valuestring : "");
+		item = get(fn, "arguments");
+		parsed = cJSON_IsString(item) ? cJSON_Parse(item->valuestring)
+		    : cJSON_IsObject(item) ? cJSON_Duplicate(item, 1) : NULL;
+		cJSON_AddItemToObject(block, "input",
+		    parsed ? parsed : cJSON_CreateObject());
+		cJSON_AddItemToArray(blocks, block);
+	}
+	cJSON_Delete(calls);
+}
+
+
+static void openai_stop(cJSON *chat)
+{
+	cJSON *item = get(chat, "stop"), *list;
+
+	if (!item)
+		return;
+	list = cJSON_IsArray(item) ? cJSON_DetachItemFromObject(chat, "stop") : NULL;
+	if (!list && cJSON_IsString(item)) {
+		list = cJSON_CreateArray();
+		if (list)
+			cJSON_AddItemToArray(list,
+			    cJSON_CreateString(item->valuestring));
+	}
+	cJSON_DeleteItemFromObject(chat, "stop");
+	if (!list || !list->child) {
+		cJSON_Delete(list);
+		return;
+	}
+	cJSON_DeleteItemFromObject(chat, "stop_sequences");
+	cJSON_AddItemToObject(chat, "stop_sequences", list);
+}
+
+/* Messages API has no system role; hoist system text to top level. */
+static void openai_system(cJSON *chat)
+{
+	struct buf sys = {0};
+
+	size_t i = 0;
+	cJSON *messages = get(chat, "messages"), *item, *part;
+
+	if (!cJSON_IsArray(messages))
+		return;
+
+	for (i = 0; i < (size_t)cJSON_GetArraySize(messages); i++) {
+		item = cJSON_GetArrayItem(messages, (int)i);
+		if (strcmp(field(item, "role"), "system"))
+			continue;
+		part = get(item, "content");
+		if (cJSON_IsString(part) && part->valuestring[0]) {
+			if (sys.n)
+				append(&sys, "\n", 1);
+			append(&sys, part->valuestring,
+			       strlen(part->valuestring));
+		}
+		free(cJSON_DetachItemFromArray(messages, (int)i));
+		i--;
+	}
+	if (!sys.s)
+		return;
+	cJSON_AddStringToObject(chat, "system", sys.s);
+	free(sys.s);
+}
+
+
+/* Absent keys must be added; ReplaceItem would drop the value. */
+static void set_item(cJSON *object, const char *key, cJSON *item)
+{
+	if (cJSON_GetObjectItemCaseSensitive(object, key))
+		cJSON_ReplaceItemInObject(object, key, item);
+	else
+		cJSON_AddItemToObject(object, key, item);
+}
+	/* Chat roles and tool traffic become Messages API blocks. */
+static void openai_messages(cJSON *chat)
+{
+	cJSON *messages = get(chat, "messages"), *item, *part, *calls, *call;
+	cJSON *blocks, *block, *fn;
+
+	if (!cJSON_IsArray(messages))
+		return;
+	cJSON_ArrayForEach(item, messages) {
+		part = get(item, "content");
+		calls = get(item, "tool_calls");
+
+		cJSON_DeleteItemFromObject(item, "reasoning_content");
+		cJSON_DeleteItemFromObject(item, "provider");
+		cJSON_DeleteItemFromObject(item, "system_fingerprint");
+		if (!strcmp(field(item, "role"), "tool")) {
+			cJSON_ReplaceItemInObject(item, "role",
+			    cJSON_CreateString("user"));
+			block = cJSON_CreateObject();
+			if (!block)
+				continue;
+			cJSON_AddStringToObject(block, "type", "tool_result");
+			cJSON_AddStringToObject(block, "tool_use_id",
+			    field(item, "tool_call_id"));
+			cJSON_AddItemToObject(block, "content",
+			    part ? cJSON_Duplicate(part, 1)
+				 : cJSON_CreateString(""));
+			blocks = cJSON_CreateArray();
+			if (!blocks) {
+				cJSON_Delete(block);
+				continue;
+			}
+			cJSON_AddItemToArray(blocks, block);
+			set_item(item, "content", blocks);
+			cJSON_DeleteItemFromObject(item, "tool_call_id");
+			continue;
+		}
+		if (!cJSON_IsArray(calls) || !calls->child)
+			continue;
+		blocks = cJSON_CreateArray();
+		if (!blocks)
+			continue;
+		if (part && cJSON_IsString(part) && part->valuestring[0]) {
+			block = cJSON_CreateObject();
+			cJSON_AddStringToObject(block, "type", "text");
+			cJSON_AddStringToObject(block, "text", part->valuestring);
+			cJSON_AddItemToArray(blocks, block);
+		}
+		cJSON_ArrayForEach(call, calls) {
+			fn = get(call, "function");
+			block = cJSON_CreateObject();
+			if (!block)
+				continue;
+			cJSON_AddStringToObject(block, "type", "tool_use");
+			copy(block, "id", get(call, "id"));
+			copy(block, "name", get(fn, "name"));
+			part = get(fn, "arguments");
+
+			fn = part && cJSON_IsString(part)
+			    ? cJSON_Parse(part->valuestring) : NULL;
+			cJSON_AddItemToObject(block, "input",
+			    fn ? fn : cJSON_CreateObject());
+			cJSON_AddItemToArray(blocks, block);
+		}
+		set_item(item, "content", blocks);
+		cJSON_DeleteItemFromObject(item, "tool_calls");
+	}
+}
+
+static void openai_request(cJSON *chat)
+{
+	static const char *const junk[] = {"audio", "function_call", "functions",
+	    "logprobs", "max_retries", "modalities", "n", "object", "prediction",
+	    "presence_penalty", "prompt_cache_key", "frequency_penalty",
+	    "reasoning_effort", "response_format", "seed", "stop", "store",
+	    "stream_options", "top_logprobs", "verbosity", "web_search_options",
+	    "parallel_tool_calls", "reasoning_budget_tokens", "user"};
+	cJSON *item;
+	size_t i;
+
+	openai_tools(chat);
+	openai_choice(chat);
+	openai_stop(chat);
+
+	openai_system(chat);
+
+	openai_messages(chat);
+	item = get(chat, "service_tier");
+	if (item && (!cJSON_IsString(item)
+	    || (strcmp(item->valuestring, "auto")
+	        && strcmp(item->valuestring, "standard_only"))))
+		cJSON_DeleteItemFromObject(chat, "service_tier");
+	for (i = 0; i < sizeof(junk) / sizeof(*junk); i++)
+		cJSON_DeleteItemFromObject(chat, junk[i]);
+}
+
+
+/* Anthropic Messages reply translated into a Chat Completions reply. */
+static cJSON *anthropic_chat(cJSON *msg)
+{
+	cJSON *chat, *choices, *choice, *message, *calls, *blocks, *item, *call,
+	       *fn, *usage, *u;
+	struct buf text = {0}, reasoning = {0};
+	double i = 0, o = 0;
+	const char *stop = field(msg, "stop_reason");
+
+	if (!cJSON_IsObject(msg) || !cJSON_IsArray(get(msg, "content")))
+		return NULL;
+	chat = cJSON_CreateObject();
+	choices = cJSON_AddArrayToObject(chat, "choices");
+	choice = cJSON_CreateObject();
+	message = cJSON_AddObjectToObject(choice, "message");
+	calls = cJSON_AddArrayToObject(message, "tool_calls");
+	if (!chat || !choices || !choice || !message || !calls) {
+		cJSON_Delete(chat);
+		return NULL;
+	}
+	cJSON_AddStringToObject(message, "role", "assistant");
+	cJSON_AddStringToObject(chat, "id", field(msg, "id"));
+	cJSON_AddStringToObject(chat, "object", "chat.completion");
+	copy(chat, "model", get(msg, "model"));
+	cJSON_AddNumberToObject(choice, "index", 0);
+	cJSON_AddItemToArray(choices, choice);
+	blocks = get(msg, "content");
+	cJSON_ArrayForEach(item, blocks) {
+		if (!strcmp(field(item, "type"), "text")) {
+			append(&text, field(item, "text"), strlen(field(item, "text")));
+		} else if (!strcmp(field(item, "type"), "tool_use")) {
+			char *input = cJSON_PrintUnformatted(get(item, "input"));
+			call = cJSON_CreateObject();
+			cJSON_AddStringToObject(call, "id", field(item, "id"));
+			cJSON_AddStringToObject(call, "type", "function");
+			fn = cJSON_AddObjectToObject(call, "function");
+			cJSON_AddStringToObject(fn, "name", field(item, "name"));
+			cJSON_AddStringToObject(fn, "arguments", input ? input : "{}");
+			free(input);
+			cJSON_AddItemToArray(calls, call);
+
+		} else if (!strcmp(field(item, "type"), "thinking")) {
+			append(&reasoning, field(item, "thinking"),
+				 strlen(field(item, "thinking")));
+		}
+	}
+	cJSON_AddStringToObject(message, "content", text.s ? text.s : "");
+
+		if (reasoning.s) {
+			cJSON_AddStringToObject(message, "reasoning_content",
+					    reasoning.s);
+			free(reasoning.s);
+			reasoning.s = NULL;
+		}
+	free(text.s);
+	cJSON_AddStringToObject(choice, "finish_reason", !strcmp(stop, "tool_use")
+	    ? "tool_calls" : !strcmp(stop, "max_tokens") ? "length" : "stop");
+	usage = get(msg, "usage");
+	if (usage) {
+		item = get(usage, "input_tokens");
+		if (item)
+			i = cJSON_GetNumberValue(item);
+		item = get(usage, "output_tokens");
+		if (item)
+			o = cJSON_GetNumberValue(item);
+		u = cJSON_CreateObject();
+		if (u) {
+			cJSON_AddNumberToObject(u, "prompt_tokens", i);
+			cJSON_AddNumberToObject(u, "completion_tokens", o);
+			cJSON_AddNumberToObject(u, "total_tokens", i + o);
+			cJSON_AddItemToObject(chat, "usage", u);
+		}
+	}
+	return chat;
+}
 static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **auth)
 {
 	struct buf body = {0};
 	char url[512], *encoded;
 	double number;
 	long budget = thinking_budget, status = 0;
-	int rc, attempt, stream;
+	int rc, attempt, stream, chat_api = !strcmp(path, "/v1/chat/completions");
 	cJSON *item;
 
 	if (!cJSON_IsObject(chat)) {
 		reply_invalid(fd, "request body must be a JSON object");
 		return;
 	}
-	openai_tools(chat);
+	item = get(chat, "reasoning_effort");
+	if (!budget && cJSON_IsString(item))
+		budget = effort_budget(item->valuestring);
+
+	if (!budget) {
+		item = get(chat, "reasoning_budget_tokens");
+		if (cJSON_IsNumber(item)) {
+			number = cJSON_GetNumberValue(item);
+			budget = number < 1024 ? 0 : (long) number;
+			if (budget > 512000)
+				budget = 512000;
+		}
+	}
+	openai_request(chat);
+
+	if (chat_api) {
+		/* Chat Completions clients get one translated JSON reply. */
+		cJSON_DeleteItemFromObject(chat, "stream");
+	}
 	if (!get(chat, "model")) {
 		if (!model) {
 			reply_invalid(fd, "model required; pass --model or send one");
@@ -644,9 +998,13 @@ static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **au
 	stream = cJSON_IsTrue(get(chat, "stream"));
 	if (!budget)
 		budget = effort_budget(reasoning_effort);
+	if (!item && chat_api) {
+		number = budget >= 1024 ? (double)budget + 2048 : 8000;
+		cJSON_AddNumberToObject(chat, "max_tokens", number);
+	}
 	if (budget && number && number <= (double)budget + 1024)
 		budget = number > 2048 ? (long)(number - 1024) : 0;
-	if (budget >= 1024 && !strcmp(path, "/v1/messages")
+	if (budget >= 1024 && (!strcmp(path, "/v1/messages") || chat_api)
 	    && !get(chat, "thinking")) {
 		item = cJSON_AddObjectToObject(chat, "thinking");
 		if (item) {
@@ -670,7 +1028,7 @@ static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **au
 		return;
 	}
 	snprintf(url, sizeof(url), "%s%s", anthropic_upstream,
-		 strcmp(path, "/v1/messages") ? "/count_tokens" : "");
+		 !strcmp(path, "/v1/messages/count_tokens") ? "/count_tokens" : "");
 	for (attempt = 0; attempt < 2; attempt++) {
 		rc = post(url, encoded, "application/json", *auth, &body, &status, fd);
 		if (rc || status != 401 || attempt || refresh(auth))
@@ -693,6 +1051,22 @@ static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **au
 		reply(fd, status >= 400 && status <= 599 ? (int)status : 502,
 		      failure(error_text));
 		return;
+
+	}
+
+	if (chat_api && status == 200) {
+		cJSON *msg = cJSON_ParseWithOpts(body.s, NULL, 1),
+		       *chat = msg ? anthropic_chat(msg) : NULL;
+		char *text = chat ? cJSON_PrintUnformatted(chat) : NULL;
+		if (text) {
+			free(body.s);
+			body.s = text;
+			body.n = strlen(text);
+		}
+		if (chat)
+			cJSON_Delete(chat);
+		if (msg)
+			cJSON_Delete(msg);
 	}
 	raw_reply(fd, status,
 		  status == 200 && stream ? "text/event-stream" : "application/json",
@@ -1766,10 +2140,10 @@ static void serve_client(int fd, cJSON **auth)
 			goto bad;
 		*colon = 0;
 		value = colon + 1;
-		while (*value == ' ' || *value == '\t')
+		while (*value == ' ' || *value == '	')
 			value++;
 		end = value + strlen(value);
-		while (end > value && (end[-1] == ' ' || end[-1] == '\t'))
+		while (end > value && (end[-1] == ' ' || end[-1] == '	'))
 			*--end = 0;
 		if (!strcasecmp(line, "Content-Length")) {
 			if (have_length++ || !*value)
@@ -1850,8 +2224,11 @@ static void serve_client(int fd, cJSON **auth)
 		error = "Content-Length required";
 		goto bad;
 	}
-	if (b.n - header_size > length)
+	if (b.n - header_size > length) {
+		status = 400;
+		error = "body longer than Content-Length";
 		goto bad;
+	}
 	if (expect_continue && b.n - header_size < length)
 		sendall(fd, "HTTP/1.1 100 Continue\r\n\r\n", 25);
 	while (b.n - header_size < length && waitfd(fd, POLLIN, deadline)) {
