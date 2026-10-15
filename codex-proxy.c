@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/time.h>
 #include <signal.h>
 #include <errno.h>
 #include <limits.h>
@@ -31,6 +32,231 @@ static long timeout = 300;
 static volatile sig_atomic_t stopped;
 static char error_text[256];
 
+
+/* Anthropic Claude subscription login: OAuth 2.0 authorization code + PKCE.
+ * Client and endpoint values track the Claude Code CLI public client. */
+static const char *backend = "codex";
+static const char *anthropic_client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+static const char *anthropic_authorize = "https://claude.ai/oauth/authorize";
+static const char *anthropic_manual_redirect = "https://platform.claude.com/oauth/code/callback";
+static const char *anthropic_token_url = "https://platform.claude.com/v1/oauth/token";
+static const char *anthropic_scopes = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+static const char *anthropic_beta = "oauth-2025-04-20,token-efficient-tools-2025-02-19";
+static char anthropic_redirect[64];
+static int code_port = 54222;
+static int manual_code;
+
+struct sha256 {
+	unsigned int h[8];
+	unsigned long long bits;
+	unsigned char buf[64];
+	size_t len;
+};
+static const unsigned int sha256_k[64] = {
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+static unsigned int rotr32(unsigned int x, unsigned int n)
+{
+	return (x >> n) | (x << (32 - n));
+}
+
+static void sha256_block(struct sha256 *s)
+{
+	unsigned int w[64], a, b, c, d, e, f, g, h, t1, t2;
+	int i;
+	for (i = 0; i < 16; i++)
+		w[i] = ((unsigned int)s->buf[i * 4] << 24)
+		       | ((unsigned int)s->buf[i * 4 + 1] << 16)
+		       | ((unsigned int)s->buf[i * 4 + 2] << 8)
+		       | (unsigned int)s->buf[i * 4 + 3];
+	for (i = 16; i < 64; i++) {
+		t1 = w[i - 15];
+		t2 = w[i - 2];
+		w[i] = (rotr32(t1, 7) ^ rotr32(t1, 18) ^ (t1 >> 3)) + w[i - 16]
+		       + (rotr32(t2, 17) ^ rotr32(t2, 19) ^ (t2 >> 10)) + w[i - 7];
+	}
+	a = s->h[0];
+	b = s->h[1];
+	c = s->h[2];
+	d = s->h[3];
+	e = s->h[4];
+	f = s->h[5];
+	g = s->h[6];
+	h = s->h[7];
+	for (i = 0; i < 64; i++) {
+		t1 = h + (rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25))
+		     + ((e & f) ^ (~e & g)) + sha256_k[i] + w[i];
+		t2 = (rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22))
+		     + ((a & b) ^ (a & c) ^ (b & c));
+		h = g;
+		g = f;
+		f = e;
+		e = d + t1;
+		d = c;
+		c = b;
+		b = a;
+		a = t1 + t2;
+	}
+	s->h[0] += a;
+	s->h[1] += b;
+	s->h[2] += c;
+	s->h[3] += d;
+	s->h[4] += e;
+	s->h[5] += f;
+	s->h[6] += g;
+	s->h[7] += h;
+}
+
+static void sha256_init(struct sha256 *s)
+{
+	static const unsigned int h0[8] = {
+		0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+		0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+	};
+	int i;
+	s->bits = 0;
+	s->len = 0;
+	for (i = 0; i < 8; i++)
+		s->h[i] = h0[i];
+}
+
+static void sha256_update(struct sha256 *s, const void *data, size_t n)
+{
+	const unsigned char *p = data;
+	size_t k;
+	s->bits += (unsigned long long)n * 8;
+	while (n) {
+		k = 64 - s->len;
+		if (k > n)
+			k = n;
+		memcpy(s->buf + s->len, p, k);
+		s->len += k;
+		p += k;
+		n -= k;
+		if (s->len < 64)
+			return;
+		sha256_block(s);
+		s->len = 0;
+	}
+}
+
+static void sha256_final(struct sha256 *s, unsigned char out[32])
+{
+	unsigned char pad = 0x80, tail[8];
+	unsigned long long bits = s->bits;
+	int i;
+	sha256_update(s, &pad, 1);
+	while (s->len != 56) {
+		pad = 0;
+		sha256_update(s, &pad, 1);
+	}
+	for (i = 0; i < 8; i++)
+		tail[i] = (unsigned char)(bits >> (56 - 8 * i));
+	sha256_update(s, tail, 8);
+	for (i = 0; i < 32; i++)
+		out[i] = (unsigned char)(s->h[i / 4] >> (24 - 8 * (i % 4)));
+}
+
+static void sha256_hex(const char *text, char out[65])
+{
+	static const char digits[] = "0123456789abcdef";
+	unsigned char digest[32];
+	struct sha256 s;
+	int i;
+	sha256_init(&s);
+	sha256_update(&s, text, strlen(text));
+	sha256_final(&s, digest);
+	for (i = 0; i < 32; i++) {
+		out[i * 2] = digits[digest[i] >> 4];
+		out[i * 2 + 1] = digits[digest[i] & 15];
+	}
+	out[64] = 0;
+}
+
+static const char b64_alphabet[] =
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+static void base64url(const unsigned char *in, size_t n, char *out)
+{
+	size_t i = 0, o = 0;
+	unsigned int v;
+	while (i + 3 <= n) {
+		v = ((unsigned int)in[i] << 16) | ((unsigned int)in[i + 1] << 8)
+		    | in[i + 2];
+		out[o++] = b64_alphabet[(v >> 18) & 63];
+		out[o++] = b64_alphabet[(v >> 12) & 63];
+		out[o++] = b64_alphabet[(v >> 6) & 63];
+		out[o++] = b64_alphabet[v & 63];
+		i += 3;
+	}
+	if (i + 1 == n) {
+		v = (unsigned int)in[i] << 16;
+		out[o++] = b64_alphabet[(v >> 18) & 63];
+		out[o++] = b64_alphabet[(v >> 12) & 63];
+	} else if (i + 2 == n) {
+		v = ((unsigned int)in[i] << 16) | ((unsigned int)in[i + 1] << 8);
+		out[o++] = b64_alphabet[(v >> 18) & 63];
+		out[o++] = b64_alphabet[(v >> 12) & 63];
+		out[o++] = b64_alphabet[(v >> 6) & 63];
+	}
+	out[o] = 0;
+}
+
+static int random_bytes(unsigned char *out, size_t n)
+{
+	unsigned char *p = out;
+	ssize_t k;
+	size_t got = 0;
+	int fd = open("/dev/urandom", O_RDONLY), retries = 0;
+	if (fd < 0)
+		return -1;
+	while (got < n && retries++ < 64) {
+		k = read(fd, p + got, n - got);
+		if (k > 0)
+			got += (size_t)k;
+		else if (k < 0 && errno == EINTR)
+			continue;
+		else
+			break;
+	}
+	close(fd);
+	return got == n ? 0 : -1;
+}
+
+static void pkce_value(const char *text, char *out)
+{
+	unsigned char digest[32];
+	struct sha256 s;
+	sha256_init(&s);
+	sha256_update(&s, text, strlen(text));
+	sha256_final(&s, digest);
+	base64url(digest, 32, out);
+}
+
+
+static void pkce_token(char *out)
+{
+	unsigned char raw[32];
+	unsigned long long seed;
+	struct sha256 s;
+	if (random_bytes(raw, sizeof(raw))) {
+		seed = (unsigned long long)time(NULL)
+		       ^ ((unsigned long long)getpid() << 11)
+		       ^ ((unsigned long long)clock() << 3);
+		sha256_init(&s);
+		sha256_update(&s, &seed, sizeof(seed));
+		sha256_final(&s, raw);
+	}
+	base64url(raw, sizeof(raw), out);
+}
 struct buf {
 	char *s;
 	size_t n, cap;
@@ -211,11 +437,35 @@ static int post(const char *url, const char *body, const char *type,
 		h = (struct buf) {
 			0
 		};
-		append(&h, "ChatGPT-Account-ID: ", 19);
-		append(&h, field(auth, "account_id"), strlen(field(auth, "account_id")));
-		headers = curl_slist_append(headers, h.s);
-		free(h.s);
-		headers = curl_slist_append(headers, "Accept: text/event-stream");
+		if (!strcmp(backend, "anthropic")) {
+			append(&h, "anthropic-version: 2023-06-01", 29);
+			headers = curl_slist_append(headers, h.s);
+			free(h.s);
+			h = (struct buf) {
+				0
+			};
+			append(&h, "anthropic-beta: ", 16);
+			append(&h, anthropic_beta, strlen(anthropic_beta));
+			headers = curl_slist_append(headers, h.s);
+			free(h.s);
+			h = (struct buf) {
+				0
+			};
+			append(&h, "User-Agent: claude-cli/2.0.0 (external, cli)", 44);
+			headers = curl_slist_append(headers, h.s);
+			free(h.s);
+			h = (struct buf) {
+				0
+			};
+			headers = curl_slist_append(headers,
+				"Accept: text/event-stream,application/json");
+		} else {
+			append(&h, "ChatGPT-Account-ID: ", 19);
+			append(&h, field(auth, "account_id"), strlen(field(auth, "account_id")));
+			headers = curl_slist_append(headers, h.s);
+			free(h.s);
+			headers = curl_slist_append(headers, "Accept: text/event-stream");
+		}
 	} else
 		headers = curl_slist_append(headers, "Accept: application/json");
 	curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -279,6 +529,24 @@ static cJSON *auth_post(const char *path, cJSON *j, int form, long *status)
 	return result;
 }
 
+
+/* Token endpoints answer JSON in both directions; auth_post only speaks form or Codex paths. */
+static cJSON *token_request(const char *url, cJSON *req, long *status)
+{
+	struct buf out = {0};
+	cJSON *result = NULL;
+	char *s = cJSON_PrintUnformatted(req);
+	if (!s)
+		return NULL;
+	if (!post(url, s, "application/json", NULL, &out, status, -1) && out.s)
+		result = cJSON_ParseWithOpts(out.s, NULL, 1);
+	if (!result && out.s)
+		snprintf(error_text, sizeof(error_text), "unexpected token reply: %.180s",
+			 out.s);
+	free(s);
+	free(out.s);
+	return result;
+}
 /* JWT payload is used only for metadata from the TLS-authenticated token reply. */
 static cJSON *claims(const char *token)
 {
@@ -357,10 +625,14 @@ static int save_auth(cJSON *j)
 
 static int valid_auth(cJSON *j)
 {
-	const char *access = field(j, "access_token"), *account = field(j,
-			     "account_id");
-	return *access && *account && !strpbrk(access, "\r\n")
-	       && !strpbrk(account, "\r\n");
+	const char *access = field(j, "access_token");
+	const char *account = field(j, "account_id");
+	if (!*access || strpbrk(access, "\r\n"))
+		return 0;
+	/* Only the Codex backend routes requests by account id. */
+	if (strcmp(backend, "anthropic") && (!*account || strpbrk(account, "\r\n")))
+		return 0;
+	return 1;
 }
 
 static cJSON *load_auth(void)
@@ -411,6 +683,34 @@ static cJSON *token_auth(cJSON *tokens, cJSON *old)
 	return j;
 }
 
+/* Anthropic answers with a flat token payload; no JWT claims to decode. */
+static cJSON *anthropic_token_auth(cJSON *tokens, cJSON *old,
+		const char *code_verifier)
+{
+	cJSON *j = cJSON_CreateObject();
+	double expires = cJSON_GetNumberValue(get(tokens, "expires_in"));
+	const char *access = field(tokens, "access_token");
+	const char *fresh = *field(tokens, "refresh_token") ?
+		field(tokens, "refresh_token") : field(old, "refresh_token");
+	if (!*access) {
+		cJSON_Delete(j);
+		return NULL;
+	}
+	cJSON_AddStringToObject(j, "backend", "anthropic");
+	cJSON_AddStringToObject(j, "access_token", access);
+	if (*fresh)
+		cJSON_AddStringToObject(j, "refresh_token", fresh);
+	if (expires > 0 && expires < 365 * 86400)
+		cJSON_AddNumberToObject(j, "expires_at", (double)time(NULL) + expires);
+	if (code_verifier && *code_verifier)
+		cJSON_AddStringToObject(j, "code_verifier", code_verifier);
+	if (!valid_auth(j)) {
+		cJSON_Delete(j);
+		return NULL;
+	}
+	return j;
+}
+
 static int refresh(cJSON **auth)
 {
 	cJSON *req = cJSON_CreateObject(), *tokens, *fresh;
@@ -419,12 +719,21 @@ static int refresh(cJSON **auth)
 		cJSON_Delete(req);
 		return -1;
 	}
-	cJSON_AddStringToObject(req, "client_id", client_id);
-	cJSON_AddStringToObject(req, "grant_type", "refresh_token");
-	cJSON_AddStringToObject(req, "refresh_token", field(*auth, "refresh_token"));
-	tokens = auth_post("/oauth/token", req, 1, &status);
+	if (!strcmp(backend, "anthropic")) {
+		cJSON_AddStringToObject(req, "client_id", anthropic_client_id);
+		cJSON_AddStringToObject(req, "grant_type", "refresh_token");
+		cJSON_AddStringToObject(req, "refresh_token", field(*auth, "refresh_token"));
+		cJSON_AddStringToObject(req, "scope", anthropic_scopes);
+		tokens = token_request(anthropic_token_url, req, &status);
+		fresh = status == 200 ? anthropic_token_auth(tokens, *auth, NULL) : NULL;
+	} else {
+		cJSON_AddStringToObject(req, "client_id", client_id);
+		cJSON_AddStringToObject(req, "grant_type", "refresh_token");
+		cJSON_AddStringToObject(req, "refresh_token", field(*auth, "refresh_token"));
+		tokens = auth_post("/oauth/token", req, 1, &status);
+		fresh = status == 200 ? token_auth(tokens, *auth) : NULL;
+	}
 	cJSON_Delete(req);
-	fresh = status == 200 ? token_auth(tokens, *auth) : NULL;
 	cJSON_Delete(tokens);
 	if (!fresh)
 		return -1;
@@ -511,6 +820,243 @@ static int login(void)
 	return 0;
 }
 
+/* Loopback listener that catches the OAuth redirect for a browser callback. */
+static int code_listener(void)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0), yes = 1;
+	struct sockaddr_in addr;
+	struct timeval idle = {
+		300, 0
+	};
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons((unsigned short)code_port);
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle))
+	    || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes))
+	    || bind(fd, (struct sockaddr *)&addr, sizeof(addr)) || listen(fd, 1)) {
+		if (fd >= 0)
+			close(fd);
+		snprintf(error_text, sizeof(error_text),
+			 "cannot listen on 127.0.0.1:%d: %s", code_port, strerror(errno));
+		return -1;
+	}
+	return fd;
+}
+
+/* Read one HTTP GET request line and return its target path. */
+static int read_request_target(int fd, char *out, size_t size)
+{
+	char request[HEADER_MAX], *start = NULL, *stop = NULL;
+	size_t n = 0;
+	ssize_t k;
+	*out = 0;
+	while (n + 1 < sizeof(request)) {
+		k = recv(fd, request + n, 1, 0);
+		if (k == 1) {
+			if (request[n] == '\n')
+				break;
+			n++;
+			continue;
+		}
+		if (k < 0 && errno == EINTR)
+			continue;
+		return -1;
+	}
+	request[n] = 0;
+	if (strncmp(request, "GET ", 4))
+		return -1;
+	start = request + 4;
+	stop = start;
+	while (*stop && *stop != ' ' && *stop != '\r' && *stop != '\n')
+		stop++;
+	if (stop == start || (size_t)(stop - start) >= size)
+		return -1;
+	memcpy(out, start, (size_t)(stop - start));
+	out[stop - start] = 0;
+	return 0;
+}
+
+static void finish_page(int fd)
+{
+	static const char page[] = "HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/html; charset=utf-8\r\n"
+		"Connection: close\r\n\r\n"
+		"<!doctype html><title>codex-proxy</title>"
+		"<p>Anthropic login captured. Return to the terminal.</p>\r\n";
+	sendall(fd, page, sizeof(page) - 1);
+}
+
+
+static int capture_query(char *query, char *out, size_t size)
+{
+	char *value = strstr(query, "code=");
+	size_t n;
+	if (!value || strchr(value, '%'))
+		return 0;
+	value += 5;
+	n = strcspn(value, "& \r\n");
+	if (!n || n >= size)
+		return 0;
+	memcpy(out, value, n);
+	out[n] = 0;
+	return 1;
+}
+
+static int wait_for_code(int listener, const char *state, char *code, size_t size)
+{
+	long long deadline = milliseconds() + 600000;
+	char target[1024], *query;
+	int fd;
+	while (!stopped && milliseconds() < deadline) {
+		fd = accept(listener, NULL, 0);
+		if (fd < 0) {
+			if (errno == EINTR)
+				continue;
+			snprintf(error_text, sizeof(error_text),
+				 "login listener failed: %s", strerror(errno));
+			return -1;
+		}
+		if (!read_request_target(fd, target, sizeof(target))) {
+			query = strchr(target, '?');
+			if (query && strstr(target, state)
+			    && capture_query(query, code, size)) {
+				finish_page(fd);
+				close(fd);
+				return 0;
+			}
+		}
+		close(fd);
+	}
+	snprintf(error_text, sizeof(error_text), "no authorization code received");
+	return -1;
+}
+
+static int anthropic_login(void)
+{
+	char verifier[65], challenge[65], state[65], target[HEADER_MAX], code[512];
+	char *encoded;
+	struct buf url = {0};
+	cJSON *req, *tokens, *auth = NULL;
+	CURL *curl = curl_easy_init();
+	long status = 0;
+	int listener = -1, result = 1;
+	if (!curl) {
+		snprintf(error_text, sizeof(error_text), "cannot initialize HTTPS");
+		fputs(error_text, stderr);
+		return 1;
+	}
+	encoded = curl_easy_escape(curl, anthropic_scopes, 0);
+	if (!encoded) {
+		snprintf(error_text, sizeof(error_text), "cannot encode OAuth scopes");
+		fputs(error_text, stderr);
+		goto done;
+	}
+	if (manual_code) {
+		snprintf(anthropic_redirect, sizeof(anthropic_redirect), "%s",
+			 anthropic_manual_redirect);
+	} else {
+		listener = code_listener();
+		if (listener < 0) {
+			fputs(error_text, stderr);
+			fputs("; retry with --manual\n", stderr);
+			goto done;
+		}
+		snprintf(anthropic_redirect, sizeof(anthropic_redirect),
+			 "http://localhost:%d/callback", code_port);
+	}
+	pkce_token(verifier);
+	pkce_value(verifier, challenge);
+	pkce_token(state);
+	append(&url, anthropic_authorize, strlen(anthropic_authorize));
+	append(&url, "?code=true&client_id=", 21);
+	append(&url, anthropic_client_id, strlen(anthropic_client_id));
+	append(&url, "&response_type=code&redirect_uri=", 33);
+	encoded = curl_easy_escape(curl, anthropic_redirect, 0);
+	if (!encoded) {
+		snprintf(error_text, sizeof(error_text), "cannot encode OAuth value");
+		fputs(error_text, stderr);
+		goto done;
+	}
+	append(&url, encoded, strlen(encoded));
+	append(&url, "&scope=", 7);
+	encoded = curl_easy_escape(curl, anthropic_scopes, 0);
+	if (!encoded) {
+		snprintf(error_text, sizeof(error_text), "cannot encode OAuth value");
+		fputs(error_text, stderr);
+		goto done;
+	}
+	append(&url, encoded, strlen(encoded));
+	append(&url, "&code_challenge=", 16);
+	append(&url, challenge, strlen(challenge));
+	append(&url, "&code_challenge_method=S256&state=", 34);
+	append(&url, state, strlen(state));
+	fprintf(stderr, "Anthropic login: open this URL in a browser\n\n%s\n\n", url.s);
+	if (!manual_code)
+		fprintf(stderr, "or rerun with --manual and paste the redirect URL\n");
+	if (manual_code) {
+		fputs("Redirect URL: ", stderr);
+		fflush(stderr);
+		if (!fgets(target, sizeof(target), stdin) || ferror(stdin)) {
+			fputs("no redirect URL entered\n", stderr);
+			goto done;
+		}
+		target[strcspn(target, "\r\n")] = 0;
+		encoded = strchr(target, '?');
+		if (!encoded || !capture_query(encoded, code, sizeof(code))) {
+			fputs("the pasted URL carries no code= parameter\n", stderr);
+			goto done;
+		}
+		if (!*state || !strstr(target, state)) {
+			fputs("state mismatch; start the login again\n", stderr);
+			goto done;
+		}
+	} else if (wait_for_code(listener, state, code, sizeof(code))) {
+		fputs(error_text, stderr);
+		fputc('\n', stderr);
+		goto done;
+	}
+	req = cJSON_CreateObject();
+	cJSON_AddStringToObject(req, "grant_type", "authorization_code");
+	cJSON_AddStringToObject(req, "code", code);
+	cJSON_AddStringToObject(req, "redirect_uri", anthropic_redirect);
+	cJSON_AddStringToObject(req, "client_id", anthropic_client_id);
+	cJSON_AddStringToObject(req, "code_verifier", verifier);
+	cJSON_AddStringToObject(req, "state", state);
+	tokens = token_request(anthropic_token_url, req, &status);
+	cJSON_Delete(req);
+	if (!tokens) {
+		fputs(error_text, stderr);
+		fputc('\n', stderr);
+		goto done;
+	}
+	if (status < 200 || status > 299) {
+		fprintf(stderr, "token exchange failed (HTTP %ld): %s\n", status,
+			field(tokens, "error"));
+		cJSON_Delete(tokens);
+		goto done;
+	}
+	auth = anthropic_token_auth(tokens, NULL, verifier);
+	cJSON_Delete(tokens);
+	if (!auth) {
+		fputs("the token reply has no usable access token\n", stderr);
+		goto done;
+	}
+	if (save_auth(auth)) {
+		fputs("could not save credentials\n", stderr);
+		cJSON_Delete(auth);
+		goto done;
+	}
+	cJSON_Delete(auth);
+	fprintf(stderr, "Login saved to %s\n", auth_file);
+	result = 0;
+done:
+	if (listener >= 0)
+		close(listener);
+	free(url.s);
+	curl_easy_cleanup(curl);
+	return result;
+}
 static cJSON *message_item(const char *role, const char *text)
 {
 	cJSON *j = cJSON_CreateObject(), *parts, *part;
@@ -1170,6 +1716,11 @@ static void usage(void)
 	      "  --host IPv4         Listener address (default: 127.0.0.1)\n"
 	      "  --timeout SECONDS   Upstream timeout (default: 300)\n"
 	      "  --upstream URL     Responses endpoint override\n"
+	      "  --backend NAME      codex (default) or anthropic\n"
+	      "  --token-url URL     Anthropic token endpoint override\n"
+	      "  --authorize-url URL Anthropic authorize endpoint override\n"
+	      "  --code-port PORT    Login redirect port for Anthropic login (54222)\n"
+	      "  --manual            Anthropic login without a loopback listener\n"
 	      "  --auth-base URL    Authentication service override\n"
 	      "CODEX_PROXY_KEY sets the local HTTP key (default: local).\n", stderr);
 }
@@ -1194,10 +1745,14 @@ int main(int argc, char **argv)
 	}
 	if (key && *key)
 		local_key = key;
-	if (home && *home) {
-		append(&default_path, home, strlen(home));
-		append(&default_path, "/.codex-proxy.json", 18);
-		auth_file = default_path.s;
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--manual"))
+			continue;
+		manual_code = 1;
+		for (; i < argc - 1; i++)
+			argv[i] = argv[i + 1];
+		argc--;
+		break;
 	}
 	for (i = 2; i < argc; i += 2) {
 		if (i + 1 == argc) {
@@ -1218,9 +1773,21 @@ int main(int argc, char **argv)
 			upstream = argv[i + 1];
 		else if (!strcmp(argv[i], "--auth-base"))
 			auth_base = argv[i + 1];
+		else if (!strcmp(argv[i], "--backend")) {
+			if (strcmp(argv[i + 1], "codex")
+			    && strcmp(argv[i + 1], "anthropic")) {
+				usage();
+				return 1;
+			}
+			backend = argv[i + 1];
+		} else if (!strcmp(argv[i], "--token-url"))
+			anthropic_token_url = argv[i + 1];
+		else if (!strcmp(argv[i], "--authorize-url"))
+			anthropic_authorize = argv[i + 1];
 		else if (!strcmp(argv[i], "--host"))
 			bind_ip = argv[i + 1];
-		else if (!strcmp(argv[i], "--port") || !strcmp(argv[i], "--timeout")) {
+		else if (!strcmp(argv[i], "--port") || !strcmp(argv[i], "--timeout")
+			   || !strcmp(argv[i], "--code-port")) {
 			errno = 0;
 			value = strtol(argv[i + 1], &end, 10);
 			if (errno || *end || value < 1 || value > 65535) {
@@ -1229,18 +1796,29 @@ int main(int argc, char **argv)
 			}
 			if (!strcmp(argv[i], "--port"))
 				port = (int)value;
-			else
+			else if (!strcmp(argv[i], "--timeout"))
 				timeout = value;
+			else
+				code_port = (int)value;
 		} else {
 			usage();
 			return 1;
 		}
+	}
+
+	if (!auth_file && home && *home) {
+		const char *name = !strcmp(backend, "anthropic") ?
+			"/.anthropic-proxy.json" : "/.codex-proxy.json";
+		append(&default_path, home, strlen(home));
+		append(&default_path, name, strlen(name));
+		auth_file = default_path.s;
 	}
 	if (inet_pton(AF_INET, bind_ip, &bind_addr) != 1) {
 		fprintf(stderr, "invalid --host IPv4 address: %s\n", bind_ip);
 		return 1;
 	}
 	if (!auth_file || !*auth_file || !valid_url(upstream) || !valid_url(auth_base)
+	    || !valid_url(anthropic_token_url) || !valid_url(anthropic_authorize)
 	    || strpbrk(local_key, "\r\n")) {
 		fputs("invalid path, key, or URL (HTTPS or loopback HTTP required)\n", stderr);
 		return 1;
@@ -1261,7 +1839,12 @@ int main(int argc, char **argv)
 	if (curl_global_init(CURL_GLOBAL_DEFAULT))
 		return 1;
 	if (!strcmp(argv[1], "login")) {
-		result = login();
+		result = strcmp(backend, "anthropic") ? login() : anthropic_login();
+		goto done;
+	}
+	if (!strcmp(backend, "anthropic")) {
+		fputs("serve: only Anthropic login is implemented so far\n", stderr);
+		result = 1;
 		goto done;
 	}
 	auth = load_auth();
