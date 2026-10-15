@@ -576,6 +576,38 @@ static long effort_budget(const char *effort)
 	return 0;
 }
 
+/* Some Messages clients send Chat Completions tool descriptors. */
+static void openai_tool(cJSON *tool, const char *key, const char *name)
+{
+	cJSON *fn = get(tool, "function");
+	cJSON *item = fn ? cJSON_DetachItemFromObject(fn, key) : NULL;
+
+	if (!item)
+		return;
+	cJSON_DeleteItemFromObject(tool, name);
+	cJSON_AddItemToObject(tool, name, item);
+}
+
+static void openai_tools(cJSON *chat)
+{
+	cJSON *tools = get(chat, "tools");
+	cJSON *tool;
+
+	if (!cJSON_IsArray(tools))
+		return;
+	cJSON_ArrayForEach(tool, tools) {
+		if (!strcasecmp(field(tool, "type"), "function")
+		    && cJSON_IsObject(get(tool, "function"))) {
+			openai_tool(tool, "name", "name");
+			openai_tool(tool, "description", "description");
+			openai_tool(tool, "input_schema", "input_schema");
+			openai_tool(tool, "parameters", "input_schema");
+			cJSON_DeleteItemFromObject(tool, "function");
+			cJSON_DeleteItemFromObject(tool, "type");
+		}
+	}
+}
+
 static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **auth)
 {
 	struct buf body = {0};
@@ -589,6 +621,7 @@ static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **au
 		reply_invalid(fd, "request body must be a JSON object");
 		return;
 	}
+	openai_tools(chat);
 	if (!get(chat, "model")) {
 		if (!model) {
 			reply_invalid(fd, "model required; pass --model or send one");
