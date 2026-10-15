@@ -318,8 +318,14 @@ static void copy(cJSON *to, const char *key, cJSON *value)
 static cJSON *failure(const char *message)
 {
 	cJSON *j = cJSON_CreateObject(), *e = cJSON_AddObjectToObject(j, "error");
-	cJSON_AddStringToObject(e, "message", message);
-	cJSON_AddStringToObject(e, "type", "proxy_error");
+
+	cJSON_AddStringToObject(e, "message", message ? message : "request failed");
+	if (strcmp(backend, "anthropic")) {
+		cJSON_AddStringToObject(e, "type", "proxy_error");
+		return j;
+	}
+	cJSON_AddStringToObject(j, "type", "error");
+	cJSON_AddStringToObject(e, "type", "api_error");
 	return j;
 }
 static void reply(int fd, int status, cJSON *j);
