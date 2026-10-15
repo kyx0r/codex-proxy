@@ -1725,6 +1725,8 @@ static void serve_client(int fd, cJSON **auth)
 			    &junk) != 3 ||
 	    (strcmp(version, "HTTP/1.1") && strcmp(version, "HTTP/1.0")))
 		goto bad;
+	if ((end = strchr(path, '?')))
+		*end = 0;
 	while ((line = strtok_r(NULL, "\r\n", &save))) {
 		colon = strchr(line, ':');
 		if (!colon)
@@ -1799,7 +1801,8 @@ static void serve_client(int fd, cJSON **auth)
 		goto done;
 	}
 	if (strcmp(path, "/v1/chat/completions")
-	    && !(anthropic_api && !strncmp(path, "/v1/messages", 12))) {
+	    && !(anthropic_api && (!strcmp(path, "/v1/messages")
+		|| !strcmp(path, "/v1/messages/count_tokens")))) {
 		status = 404;
 		error = "unknown endpoint";
 		goto bad;
