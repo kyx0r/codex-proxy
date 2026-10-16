@@ -2343,6 +2343,7 @@ static void usage(void)
 	      "  --manual            Anthropic login without a loopback listener\n"
 	      "  --auth-base URL    Authentication service override\n"
 	      "  --thinking-budget N   Anthropic thinking budget (1024-512000)\n"
+	      "  --beta LIST           anthropic-beta header override\n"
 	      "  --upstream-anthropic URL Anthropic Messages endpoint override\n"
 	      "CODEX_PROXY_KEY sets the local HTTP key (default: local).\n", stderr);
 }
@@ -2385,6 +2386,8 @@ int main(int argc, char **argv)
 			auth_file = argv[i + 1];
 		else if (!strcmp(argv[i], "--model"))
 			model = argv[i + 1];
+		else if (!strcmp(argv[i], "--beta"))
+			anthropic_beta = argv[i + 1];
 		else if (!strcmp(argv[i], "--reasoning-effort")) {
 			if (!*argv[i + 1]) {
 				usage();
