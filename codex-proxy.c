@@ -446,6 +446,7 @@ static int post(const char *url, const char *body, const char *type,
 	CURLcode code;
 	struct curl_slist *headers = NULL;
 	struct buf h = {0};
+	const char *version;
 	if (!curl)
 		return -1;
 	append(&h, "Content-Type: ", 14);
@@ -478,7 +479,13 @@ static int post(const char *url, const char *body, const char *type,
 			h = (struct buf) {
 				0
 			};
-			append(&h, "User-Agent: claude-cli/2.0.0 (external, cli)", 44);
+			/* Subscription gating compares this client version with the model. */
+			version = getenv("CODEX_PROXY_CLAUDE_VERSION");
+			if (!version || !*version)
+				version = "2.1.280";
+			append(&h, "User-Agent: claude-cli/", 23);
+			append(&h, version, strlen(version));
+			append(&h, " (external, cli)", 16);
 			headers = curl_slist_append(headers, h.s);
 			free(h.s);
 			h = (struct buf) {

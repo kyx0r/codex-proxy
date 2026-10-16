@@ -136,6 +136,9 @@ instead of translating Chat Completions:
 - Credentials are kept in `$HOME/.anthropic-proxy.json` (mode 0600, with a
   sibling `.lock` file). The server refreshes an expired token before sending
   and retries one request after an upstream HTTP 401.
+- Anthropic gates models by Claude Code version. Requests carry the OAuth user
+  agent `claude-cli/2.1.280 (external, cli)`; set `CODEX_PROXY_CLAUDE_VERSION`
+  to raise it when a newer model demands a newer client.
 - `POST /v1/messages` and `POST /v1/messages/count_tokens` are relayed verbatim:
   upstream status and body are returned unchanged, `"stream": true` is passed
   through as `text/event-stream`, and upstream errors keep their own shape.
