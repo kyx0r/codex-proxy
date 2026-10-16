@@ -187,3 +187,19 @@ Protocol references inspected during implementation:
 
 These are protocol references, not dependencies. The implementation is separate;
 cJSON retains its own license in its source files.
+
+## Subscription rate limit tiers (Anthropic backend)
+
+A claude.ai OAuth token (`sk-ant-oat01-...`) reaches a model through the tier bound
+to the token, not through the model name. Pro plan tokens carry
+`rateLimitTier: default_claude_ai` (see `~/.claude/.credentials.json`); that tier
+answers 200 for `claude-haiku-4-5` and `429 rate_limit_error` for
+`claude-sonnet-4-5` and `claude-opus-5-5`, with `x-should-retry: true` and no
+`Retry-After`. Posting Claude Code's own access token straight to
+`api.anthropic.com/v1/messages` reproduces the same 429, so the limit is the plan
+tier and not the proxy. The `anthropic-beta: oauth-2025-04-20` header, the
+`claude-cli/...` User-Agent and `x-app: cli` decide only whether the request is
+authenticated: without them the answer is `401 authentication_error`
+("x-api-key header is required"), with them the request is authenticated and
+then throttled. There is no client certificate or signature to defeat; the
+model either fits the tier or it does not.
