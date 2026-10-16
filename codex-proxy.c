@@ -773,26 +773,27 @@ static void set_item(cJSON *object, const char *key, cJSON *item)
 		cJSON_AddItemToObject(object, key, item);
 }
 	/* Chat roles and tool traffic become Messages API blocks. */
+
 static void openai_messages(cJSON *chat)
 {
+	static const char *const junk[] = {"audio", "function_call", "name",
+	    "provider", "reasoning_content", "system_fingerprint"};
 	cJSON *messages = get(chat, "messages"), *item, *part, *calls, *call;
 	cJSON *blocks, *block, *fn;
+	size_t i;
 
 	if (!cJSON_IsArray(messages))
 		return;
 	cJSON_ArrayForEach(item, messages) {
 		part = get(item, "content");
-		calls = get(item, "tool_calls");
-
-		cJSON_DeleteItemFromObject(item, "reasoning_content");
-		cJSON_DeleteItemFromObject(item, "provider");
-		cJSON_DeleteItemFromObject(item, "system_fingerprint");
+		for (i = 0; i < sizeof(junk) / sizeof(*junk); i++)
+			cJSON_DeleteItemFromObject(item, junk[i]);
 		if (!strcmp(field(item, "role"), "tool")) {
-			cJSON_ReplaceItemInObject(item, "role",
-			    cJSON_CreateString("user"));
 			block = cJSON_CreateObject();
-			if (!block)
+			if (!block) {
+				cJSON_DeleteItemFromObject(item, "tool_calls");
 				continue;
+			}
 			cJSON_AddStringToObject(block, "type", "tool_result");
 			cJSON_AddStringToObject(block, "tool_use_id",
 			    field(item, "tool_call_id"));
@@ -805,39 +806,51 @@ static void openai_messages(cJSON *chat)
 				continue;
 			}
 			cJSON_AddItemToArray(blocks, block);
+			cJSON_ReplaceItemInObject(item, "role",
+			    cJSON_CreateString("user"));
 			set_item(item, "content", blocks);
 			cJSON_DeleteItemFromObject(item, "tool_call_id");
+			cJSON_DeleteItemFromObject(item, "tool_calls");
 			continue;
 		}
-		if (!cJSON_IsArray(calls) || !calls->child)
-			continue;
+		calls = cJSON_DetachItemFromObject(item, "tool_calls");
 		blocks = cJSON_CreateArray();
-		if (!blocks)
+		if (!blocks) {
+			cJSON_Delete(calls);
 			continue;
-		if (part && cJSON_IsString(part) && part->valuestring[0]) {
-			block = cJSON_CreateObject();
-			cJSON_AddStringToObject(block, "type", "text");
-			cJSON_AddStringToObject(block, "text", part->valuestring);
-			cJSON_AddItemToArray(blocks, block);
 		}
-		cJSON_ArrayForEach(call, calls) {
-			fn = get(call, "function");
+		if (cJSON_IsString(part) && part->valuestring[0]) {
 			block = cJSON_CreateObject();
-			if (!block)
-				continue;
-			cJSON_AddStringToObject(block, "type", "tool_use");
-			copy(block, "id", get(call, "id"));
-			copy(block, "name", get(fn, "name"));
-			part = get(fn, "arguments");
-
-			fn = part && cJSON_IsString(part)
-			    ? cJSON_Parse(part->valuestring) : NULL;
-			cJSON_AddItemToObject(block, "input",
-			    fn ? fn : cJSON_CreateObject());
-			cJSON_AddItemToArray(blocks, block);
+			if (block) {
+				cJSON_AddStringToObject(block, "type", "text");
+				cJSON_AddStringToObject(block, "text",
+				    part->valuestring);
+				cJSON_AddItemToArray(blocks, block);
+			}
 		}
-		set_item(item, "content", blocks);
-		cJSON_DeleteItemFromObject(item, "tool_calls");
+		if (cJSON_IsArray(calls))
+			cJSON_ArrayForEach(call, calls) {
+				fn = get(call, "function");
+				block = cJSON_CreateObject();
+				if (!block)
+					continue;
+				cJSON_AddStringToObject(block, "type", "tool_use");
+				copy(block, "id", get(call, "id"));
+				copy(block, "name", get(fn, "name"));
+				part = get(fn, "arguments");
+				fn = cJSON_IsString(part)
+				    ? cJSON_Parse(part->valuestring) : NULL;
+				cJSON_AddItemToObject(block, "input",
+				    fn ? fn : cJSON_CreateObject());
+				cJSON_AddItemToArray(blocks, block);
+			}
+		cJSON_Delete(calls);
+		if (blocks->child)
+			set_item(item, "content", blocks);
+		else {
+			cJSON_Delete(blocks);
+			set_item(item, "content", cJSON_CreateString(""));
+		}
 	}
 }
 
@@ -915,6 +928,8 @@ static cJSON *anthropic_chat(cJSON *msg)
 				 strlen(field(item, "thinking")));
 		}
 	}
+	if (!calls->child)
+		cJSON_DeleteItemFromObject(message, "tool_calls");
 	cJSON_AddStringToObject(message, "content", text.s ? text.s : "");
 
 		if (reasoning.s) {
@@ -1004,6 +1019,10 @@ static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **au
 	}
 	if (budget && number && number <= (double)budget + 1024)
 		budget = number > 2048 ? (long)(number - 1024) : 0;
+	/* Forcing tool use conflicts with extended thinking. */
+	item = get(chat, "tool_choice");
+	if (cJSON_IsObject(item) && strcmp(field(item, "type"), "none"))
+		budget = 0;
 	if (budget >= 1024 && (!strcmp(path, "/v1/messages") || chat_api)
 	    && !get(chat, "thinking")) {
 		item = cJSON_AddObjectToObject(chat, "thinking");
