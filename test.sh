@@ -54,6 +54,8 @@ esac
 R=$(probe '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Print line 1 with the ex tool."}],"tools":'"$TOOLS"',"tool_choice":"required"}')
 case "$R" in
     *'"tool_calls":[{"id"'*) pass 'forced tool call is relayed as tool_calls' ;;
+    *'not supported for this model'*)
+        printf 'skip  forced tool call (model rejects forced tool_choice)\n' ;;
     *) fail 'forced tool call is relayed as tool_calls' "$R" ;;
 esac
 
