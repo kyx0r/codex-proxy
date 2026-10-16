@@ -188,18 +188,28 @@ Protocol references inspected during implementation:
 These are protocol references, not dependencies. The implementation is separate;
 cJSON retains its own license in its source files.
 
-## Subscription rate limit tiers (Anthropic backend)
+## Claude Code attribution (Anthropic backend)
 
-A claude.ai OAuth token (`sk-ant-oat01-...`) reaches a model through the tier bound
-to the token, not through the model name. Pro plan tokens carry
-`rateLimitTier: default_claude_ai` (see `~/.claude/.credentials.json`); that tier
-answers 200 for `claude-haiku-4-5` and `429 rate_limit_error` for
-`claude-sonnet-4-5` and `claude-opus-5-5`, with `x-should-retry: true` and no
-`Retry-After`. Posting Claude Code's own access token straight to
-`api.anthropic.com/v1/messages` reproduces the same 429, so the limit is the plan
-tier and not the proxy. The `anthropic-beta: oauth-2025-04-20` header, the
-`claude-cli/...` User-Agent and `x-app: cli` decide only whether the request is
-authenticated: without them the answer is `401 authentication_error`
-("x-api-key header is required"), with them the request is authenticated and
-then throttled. There is no client certificate or signature to defeat; the
-model either fits the tier or it does not.
+A claude.ai OAuth token (sk-ant-oat01-...) is metered by the tier bound to the
+token, not by the model name: Pro plan tokens report
+`rateLimitTier: default_claude_ai` (see `~/.claude/.credentials.json`). Asked
+plainly, that tier answers 200 for `claude-haiku-4-5` and
+`429 rate_limit_error` for `claude-sonnet-4-5` and `claude-opus-5-5`, with
+`x-should-retry: true` and no `Retry-After`. Re-login does not change this:
+a fresh token lands in the same tier, and Claude Code own access token posted
+straight to `api.anthropic.com/v1/messages` 429s the same way.
+
+What Claude Code does differently is not a signature. It puts
+`x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cch=...;`
+as the *first block of its system prompt*, and the gateway bills the request
+against the Claude Code allowance: with that line a Pro token returns 200 for
+opus and sonnet, without it 429. The proxy prepends the same line, reusing
+CODEX_PROXY_CLAUDE_VERSION and a varying `cch`, in front of whatever system
+text the client sent; `CODEX_PROXY_CC_BILLING=` (empty) leaves it out and puts
+the request back in the plain subscription bucket. Neither the `?beta=true`
+query form nor that billing line as an HTTP header has any effect. The
+`anthropic-beta: oauth-2025-04-20` header and `claude-cli/...` User-Agent
+decide only whether a request authenticates: without them it is
+`401 authentication_error` ("x-api-key header is required"); with them it
+authenticates and is then metered.
+

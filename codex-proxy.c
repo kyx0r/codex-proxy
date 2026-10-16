@@ -779,6 +779,50 @@ static void set_item(cJSON *object, const char *key, cJSON *item)
 	else
 		cJSON_AddItemToObject(object, key, item);
 }
+/*
+ * The Messages API meters a claude.ai token by client: without the CLI
+ * attribution line a Pro token only carries allowance for the small
+ * model and every larger model is refused with rate_limit_error
+ * before inference starts.  Claude Code sends the line as its first
+ * system block, not as a header, so send the same one.
+ * CODEX_PROXY_CC_BILLING=0 leaves it out and bills the plain
+ * subscription bucket instead.
+ */
+static void openai_billing(cJSON *chat)
+{
+	struct buf sys = {
+		0
+	};
+	cJSON *old = get(chat, "system");
+	const char *env = getenv("CODEX_PROXY_CLAUDE_VERSION");
+	const char *off = getenv("CODEX_PROXY_CC_BILLING");
+	char *tag;
+	size_t len;
+
+	if (off && !*off)
+		return;
+	if (!env || !*env)
+		env = "2.1.280";
+	len = strlen(env) + 96;
+	tag = malloc(len);
+	if (!tag)
+		return;
+	snprintf(tag, len,
+	    "x-anthropic-billing-header: cc_version=%s; cc_entrypoint=cli; "
+	    "cch=%08lx;", env,
+	    (unsigned long)(time(NULL) ^ (unsigned long)chat));
+	if (cJSON_IsString(old) && old->valuestring[0]) {
+		append(&sys, tag, strlen(tag));
+		append(&sys, "\n\n", 2);
+		append(&sys, old->valuestring,
+		    strlen(old->valuestring));
+	} else
+		append(&sys, tag, strlen(tag));
+	free(tag);
+	set_item(chat, "system", cJSON_CreateString(sys.s));
+	free(sys.s);
+}
+
 	/* Chat roles and tool traffic become Messages API blocks. */
 
 static void openai_messages(cJSON *chat)
@@ -877,6 +921,7 @@ static void openai_request(cJSON *chat)
 	openai_stop(chat);
 
 	openai_system(chat);
+	openai_billing(chat);
 
 	openai_messages(chat);
 	item = get(chat, "service_tier");
