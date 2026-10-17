@@ -17,7 +17,7 @@ probe() {
         -H "Authorization: Bearer $KEY" -d "$1"
 }
 
-./codex-proxy serve --backend anthropic --port "$PORT" --host 127.0.0.1 \
+CODEX_PROXY_DEBUG_USAGE=1 ./codex-proxy serve --backend anthropic --port "$PORT" --host 127.0.0.1 \
     --model "$MODEL" >/tmp/codex-proxy-test.log 2>&1 &
 proxy=$!
 trap 'kill $proxy 2>/dev/null' EXIT INT TERM
@@ -66,6 +66,28 @@ case "$R" in
     *) fail 'two tool rounds feed the final answer' "$R" ;;
 esac
 
+
+# Prompt caching: the gateway meters cache_control on message blocks only,
+# and only once the marked block reaches the model minimum: 1024 tokens on
+# Sonnet, 4096 on Opus and Haiku.  Send one block past the higher floor
+# twice and read the counters back out of the log (DEBUG_USAGE=1).
+LONG=$(awk 'BEGIN{while(n++<400)printf "The buffer holds editor output that must be summarised carefully. "}')
+CACHE='{"model":"'"$MODEL"'","max_tokens":64,"system":"You are a terse editor. Reply OK.","messages":[{"role":"user","content":"Say OK after reading this. '"$LONG"'"}],"tools":'"$TOOLS"'}'
+for round in 1 2; do
+    probe "$CACHE" >/dev/null
+done
+if grep -qE 'cache_(read|write) [1-9]' /tmp/codex-proxy-test.log; then
+    grep 'upstream usage' /tmp/codex-proxy-test.log | tail -2
+    pass 'long marked prompt bills cache_read or cache_write'
+else
+    fail 'cache_read and cache_write both zero for a long marked prompt' \
+        "$(grep 'upstream usage' /tmp/codex-proxy-test.log | tail -2)"
+fi
+if grep -q 'upstream usage' /tmp/codex-proxy-test.log; then
+    pass 'upstream usage logged with cache counters'
+else
+    fail 'upstream usage counters not logged' "$(tail -3 /tmp/codex-proxy-test.log)"
+fi
 # 5. Live nextvi run: prompt, ex tool call, tool result, second turn.
 # The editor only drives the agent when it has a terminal.
 if [ -t 1 ]; then

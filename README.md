@@ -204,12 +204,47 @@ What Claude Code does differently is not a signature. It puts
 as the *first block of its system prompt*, and the gateway bills the request
 against the Claude Code allowance: with that line a Pro token returns 200 for
 opus and sonnet, without it 429. The proxy prepends the same line, reusing
-CODEX_PROXY_CLAUDE_VERSION and a varying `cch`, in front of whatever system
-text the client sent; `CODEX_PROXY_CC_BILLING=` (empty) leaves it out and puts
-the request back in the plain subscription bucket. Neither the `?beta=true`
-query form nor that billing line as an HTTP header has any effect. The
+CODEX_PROXY_CLAUDE_VERSION and a `cch` that is fixed per process, in front of
+whatever system text the client sent; `CODEX_PROXY_CC_BILLING=` (empty, or `0`)
+leaves it out and puts the request back in the plain subscription bucket.
+Neither the `?beta=true` query form nor that billing line as an HTTP header has
+any effect. The
 `anthropic-beta: oauth-2025-04-20` header and `claude-cli/...` User-Agent
 decide only whether a request authenticates: without them it is
 `401 authentication_error` ("x-api-key header is required"); with them it
 authenticates and is then metered.
 
+## Prompt caching (Anthropic backend)
+
+An agent loop resends the same system prompt and tool list on every tool
+round.  The Messages API bills a cached prefix that ends at a
+`"cache_control": {"type": "ephemeral"}` breakpoint, and this gateway meters
+that mark on a **message block only**: marks on the `system` blocks and on
+`tools` are schema-checked (answering a wrong field there with HTTP 400
+`system.1.cache_control.ephemeral.scope: Extra inputs are not permitted`)
+but never billed, so `openai_cache_tail()` marks the newest message block
+past 4096 characters and falls back to the newest block when none is.  The
+breakpoint must also sit behind the model minimum, measured here at about
+1024 tokens on Sonnet and about 4096 on Opus and Haiku; a mark under the
+floor is accepted and costs nothing.  The mark is placed after the tool
+traffic is converted to blocks, so it never lands on a `tool_result` that
+`tools` already covers, and four breakpoints in a request is the most the
+gateway allows.
+
+The `cch` field of the Claude Code billing line is fixed for the life of the
+process (`cache_nonce()`); it used to carry `time(NULL) ^ request pointer`,
+which changed the first cached system line on every request.
+`CODEX_PROXY_CACHE=0` drops every mark, and `CODEX_PROXY_CC_BILLING=0` drops
+the billing line itself.
+
+To watch the counters, start the proxy with `CODEX_PROXY_DEBUG_USAGE=1`: each
+request logs `upstream usage http 200: input N cache_read N cache_write N
+output N` to stderr, reading the counters from the SSE body when the request
+streams.  `CODEX_PROXY_DEBUG_REQ=/tmp/req.json` also writes the exact outbound
+body and its headers to `/tmp/req.json[.hdrs]`, which is how the placements
+above were measured.  Chat Completions clients get the same numbers back:
+cached tokens are added to `prompt_tokens` and reported as
+`usage.prompt_tokens_details.cached_tokens`.
+
+`./test.sh` proves the loop end to end: one long marked prompt billed
+`cache_write 5378` on its first round and `cache_read 5378` on its second.

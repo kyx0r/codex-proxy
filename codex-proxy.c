@@ -502,6 +502,26 @@ static int post(const char *url, const char *body, const char *type,
 		}
 	} else
 		headers = curl_slist_append(headers, "Accept: application/json");
+
+	if (getenv("CODEX_PROXY_DEBUG_REQ")) {
+		char path[4096];
+		struct curl_slist *item;
+		FILE *f;
+
+		snprintf(path, sizeof(path), "%s.hdrs",
+		    getenv("CODEX_PROXY_DEBUG_REQ"));
+		f = fopen(path, "w");
+		if (f) {
+			for (item = headers; item; item = item->next)
+				fprintf(f, "%s\r\n", item->data);
+			fclose(f);
+		}
+		f = fopen(getenv("CODEX_PROXY_DEBUG_REQ"), "w");
+		if (f) {
+			fputs(body, f);
+			fclose(f);
+		}
+	}
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(body));
@@ -779,6 +799,151 @@ static void set_item(cJSON *object, const char *key, cJSON *item)
 	else
 		cJSON_AddItemToObject(object, key, item);
 }
+
+/*
+ * Prompt caching: an agent loop resends the same system prompt and tool
+ * list every round.  Without cache_control the gateway rebills that whole
+ * prefix on each request, so mark the end of the stable prefix and later
+ * rounds read it from the cache.  CODEX_PROXY_CACHE=0 leaves the marks out.
+ */
+static int cache_on(void)
+{
+	const char *off = getenv("CODEX_PROXY_CACHE");
+
+	return !off || strcmp(off, "0");
+}
+
+/* The billing line sits inside the cached prefix, so keep cch fixed. */
+static unsigned long cache_nonce(void)
+{
+	static unsigned long nonce;
+
+	if (!nonce) {
+		nonce = (unsigned long)time(NULL)
+		    ^ (unsigned long)(size_t)&nonce;
+		if (!nonce)
+			nonce = 1;
+	}
+	return nonce;
+}
+
+static void cache_mark(cJSON *item)
+{
+	cJSON *mark;
+
+	if (!cJSON_IsObject(item) || get(item, "cache_control"))
+		return;
+	mark = cJSON_CreateObject();
+	if (!mark)
+		return;
+	cJSON_AddStringToObject(mark, "type", "ephemeral");
+	cJSON_AddItemToObject(item, "cache_control", mark);
+}
+
+
+/* One Messages text block; only the marked one joins the cached prefix. */
+static void openai_block(cJSON *blocks, const char *text, size_t n, int mark)
+{
+	cJSON *block = cJSON_CreateObject();
+	char *tmp;
+
+	if (!block)
+		return;
+	tmp = allocate(n + 1);
+	memcpy(tmp, text, n);
+	tmp[n] = 0;
+	cJSON_AddStringToObject(block, "type", "text");
+	cJSON_AddStringToObject(block, "text", tmp);
+	free(tmp);
+	if (mark)
+		cache_mark(block);
+	cJSON_AddItemToArray(blocks, block);
+}
+/* Mark the stable prefix: the system prompt, then the last tool. */
+static void openai_cache(cJSON *chat)
+{
+
+	cJSON *system = get(chat, "system"), *blocks, *tools, *last;
+	const char *text;
+	char *nl;
+	size_t cut = 0;
+
+	if (!cache_on())
+		return;
+	text = str(system);
+	if (cJSON_IsString(system) && text[0]) {
+		blocks = cJSON_CreateArray();
+		if (!blocks)
+			return;
+		/* Claude Code sends its billing line as a block of its own, and the
+		 * gateway only reads system text that follows that block. */
+		if (!strncmp(text, "x-anthropic-billing-header:", 27)
+		    && (nl = strstr(text, "\n\n")) != NULL)
+			cut = (size_t)(nl - text) + 2;
+		if (cut)
+			openai_block(blocks, text, cut, 0);
+		openai_block(blocks, text + cut, strlen(text + cut), 1);
+		set_item(chat, "system", blocks);
+	}
+	tools = get(chat, "tools");
+	if (!cJSON_IsArray(tools))
+		return;
+	for (last = tools->child; last && last->next; last = last->next)
+		;
+	cache_mark(last);
+}
+
+/*
+ * The gateway meters cache_control on message blocks only: marks on the
+ * system and tool blocks are schema-checked but never billed.  A mark also
+ * counts only once the block behind it reaches the model minimum, measured
+ * at 1024 tokens on Sonnet and 4096 on Opus and Haiku, so mark the newest
+ * block past the smallest floor and fall back to the newest block: a floor
+ * the model does not accept costs nothing extra.  The cached prefix runs
+ * tools, system prompt and transcript, which is what the next round reads
+ * back as cache_read_input_tokens.  Four breakpoints at most, one of which
+ * the gateway assigns to tools on its own.
+ */
+static size_t cache_block(cJSON *block)
+{
+	cJSON *item = get(block, "text");
+	char *printed;
+	size_t n = 0;
+
+	if (!item)
+		item = get(block, "content");
+	if (cJSON_IsString(item))
+		return strlen(item->valuestring);
+	if (!item)
+		return 0;
+	printed = cJSON_PrintUnformatted(item);
+	if (printed) {
+		n = strlen(printed);
+		free(printed);
+	}
+	return n;
+}
+
+static void openai_cache_tail(cJSON *chat)
+{
+	cJSON *messages = get(chat, "messages"), *message, *content, *block;
+	cJSON *large = NULL, *last = NULL;
+
+	if (!cache_on() || !cJSON_IsArray(messages))
+		return;
+	for (message = messages->child; message; message = message->next) {
+		content = get(message, "content");
+		if (!cJSON_IsArray(content))
+			continue;
+		for (block = content->child; block; block = block->next) {
+			last = block;
+			if (cache_block(block) >= 4096)	/* ~1024 tokens */
+				large = block;
+		}
+	}
+	cache_mark(large ? large : last);
+}
+
 /*
  * The Messages API meters a claude.ai token by client: without the CLI
  * attribution line a Pro token only carries allowance for the small
@@ -799,7 +964,7 @@ static void openai_billing(cJSON *chat)
 	char *tag;
 	size_t len;
 
-	if (off && !*off)
+	if (off && (!*off || !strcmp(off, "0")))
 		return;
 	if (!env || !*env)
 		env = "2.1.280";
@@ -810,7 +975,7 @@ static void openai_billing(cJSON *chat)
 	snprintf(tag, len,
 	    "x-anthropic-billing-header: cc_version=%s; cc_entrypoint=cli; "
 	    "cch=%08lx;", env,
-	    (unsigned long)(time(NULL) ^ (unsigned long)chat));
+	    (unsigned long)cache_nonce());
 	if (cJSON_IsString(old) && old->valuestring[0]) {
 		append(&sys, tag, strlen(tag));
 		append(&sys, "\n\n", 2);
@@ -918,12 +1083,14 @@ static void openai_request(cJSON *chat)
 
 	openai_tools(chat);
 	openai_choice(chat);
-	openai_stop(chat);
 
 	openai_system(chat);
 	openai_billing(chat);
+	openai_cache(chat);
 
 	openai_messages(chat);
+
+	openai_cache_tail(chat);
 	item = get(chat, "service_tier");
 	if (item && (!cJSON_IsString(item)
 	    || (strcmp(item->valuestring, "auto")
@@ -931,6 +1098,18 @@ static void openai_request(cJSON *chat)
 		cJSON_DeleteItemFromObject(chat, "service_tier");
 	for (i = 0; i < sizeof(junk) / sizeof(*junk); i++)
 		cJSON_DeleteItemFromObject(chat, junk[i]);
+
+	if (getenv("CODEX_PROXY_DEBUG_REQ")) {
+		char *dump = cJSON_PrintUnformatted(chat);
+		FILE *f = fopen(getenv("CODEX_PROXY_DEBUG_REQ"), "w");
+
+		if (f) {
+			if (dump)
+				fwrite(dump, 1, strlen(dump), f);
+			fclose(f);
+		}
+		free(dump);
+	}
 }
 
 
@@ -994,23 +1173,89 @@ static cJSON *anthropic_chat(cJSON *msg)
 	cJSON_AddStringToObject(choice, "finish_reason", !strcmp(stop, "tool_use")
 	    ? "tool_calls" : !strcmp(stop, "max_tokens") ? "length" : "stop");
 	usage = get(msg, "usage");
+
 	if (usage) {
+		double cached = 0, fresh = 0;
+		cJSON *details;
+
 		item = get(usage, "input_tokens");
 		if (item)
 			i = cJSON_GetNumberValue(item);
 		item = get(usage, "output_tokens");
 		if (item)
 			o = cJSON_GetNumberValue(item);
+		/* Cached prompt tokens are billed but not counted in input_tokens,
+		 * so add them back and keep the read count where OpenAI clients
+		 * look for it: prompt_tokens_details.cached_tokens. */
+		item = get(usage, "cache_read_input_tokens");
+		if (item)
+			cached = cJSON_GetNumberValue(item);
+		item = get(usage, "cache_creation_input_tokens");
+		if (item)
+			fresh = cJSON_GetNumberValue(item);
+		i += cached + fresh;
 		u = cJSON_CreateObject();
 		if (u) {
 			cJSON_AddNumberToObject(u, "prompt_tokens", i);
 			cJSON_AddNumberToObject(u, "completion_tokens", o);
 			cJSON_AddNumberToObject(u, "total_tokens", i + o);
+			if (cached || fresh) {
+				details = cJSON_CreateObject();
+				if (details) {
+					cJSON_AddNumberToObject(details,
+					    "cached_tokens", cached);
+					cJSON_AddItemToObject(u,
+					    "prompt_tokens_details", details);
+				}
+			}
 			cJSON_AddItemToObject(chat, "usage", u);
 		}
 	}
 	return chat;
 }
+
+/* Confirm caching from stderr: CODEX_PROXY_DEBUG_USAGE=1 logs the upstream
+ * usage object, including the cache counters, for every request.  Streams
+ * carry the same object inside the SSE body, so look there too.
+ */
+static void log_usage(struct buf *body, long status)
+{
+	const char *debug = getenv("CODEX_PROXY_DEBUG_USAGE");
+	cJSON *reply, *usage, *solo = NULL, *item;
+	double in = 0, read = 0, write = 0, out = 0;
+
+	if (!debug || strcmp(debug, "1") || !body->s)
+		return;
+	reply = cJSON_ParseWithOpts(body->s, NULL, 1);
+	usage = get(reply, "usage");
+	if (!usage) {
+		const char *mark = strstr(body->s, "\"usage\":");
+		if (mark)
+			usage = solo = cJSON_ParseWithOpts(mark + 8, NULL, 1);
+	}
+	if (!cJSON_IsObject(usage)) {
+		cJSON_Delete(solo);
+		cJSON_Delete(reply);
+		return;
+	}
+	item = get(usage, "input_tokens");
+	if (item)
+		in = cJSON_GetNumberValue(item);
+	item = get(usage, "cache_read_input_tokens");
+	if (item)
+		read = cJSON_GetNumberValue(item);
+	item = get(usage, "cache_creation_input_tokens");
+	if (item)
+		write = cJSON_GetNumberValue(item);
+	item = get(usage, "output_tokens");
+	if (item)
+		out = cJSON_GetNumberValue(item);
+	fprintf(stderr, "upstream usage http %ld: input %.0f cache_read %.0f"
+	    " cache_write %.0f output %.0f\n", status, in, read, write, out);
+	cJSON_Delete(solo);
+	cJSON_Delete(reply);
+}
+
 static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **auth)
 {
 	struct buf body = {0};
@@ -1124,6 +1369,7 @@ static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **au
 		return;
 
 	}
+	log_usage(&body, status);
 
 	if (chat_api && status == 200) {
 		cJSON *msg = cJSON_ParseWithOpts(body.s, NULL, 1),
