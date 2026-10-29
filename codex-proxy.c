@@ -1592,6 +1592,8 @@ static cJSON *anthropic_token_auth(cJSON *tokens, cJSON *old,
 	const char *access = field(tokens, "access_token");
 	const char *fresh = *field(tokens, "refresh_token") ?
 		field(tokens, "refresh_token") : field(old, "refresh_token");
+	const char *verifier = code_verifier && *code_verifier ?
+		code_verifier : field(old, "code_verifier");
 	if (!*access) {
 		cJSON_Delete(j);
 		return NULL;
@@ -1602,8 +1604,12 @@ static cJSON *anthropic_token_auth(cJSON *tokens, cJSON *old,
 		cJSON_AddStringToObject(j, "refresh_token", fresh);
 	if (expires > 0 && expires < 365 * 86400)
 		cJSON_AddNumberToObject(j, "expires_at", (double)time(NULL) + expires);
-	if (code_verifier && *code_verifier)
-		cJSON_AddStringToObject(j, "code_verifier", code_verifier);
+	else
+		copy(j, "expires_at", get(old, "expires_at"));
+	/* Anthropic ties the refresh token to the PKCE verifier, so it outlives
+	 * the code that carried it: keep it and resend it on every refresh. */
+	if (*verifier)
+		cJSON_AddStringToObject(j, "code_verifier", verifier);
 	if (!valid_auth(j)) {
 		cJSON_Delete(j);
 		return NULL;
@@ -1624,6 +1630,7 @@ static int refresh(cJSON **auth)
 		cJSON_AddStringToObject(req, "grant_type", "refresh_token");
 		cJSON_AddStringToObject(req, "refresh_token", field(*auth, "refresh_token"));
 		cJSON_AddStringToObject(req, "scope", anthropic_scopes);
+		copy(req, "code_verifier", get(*auth, "code_verifier"));
 		tokens = token_request(anthropic_token_url, req, &status);
 		fresh = status == 200 ? anthropic_token_auth(tokens, *auth, NULL) : NULL;
 	} else {
