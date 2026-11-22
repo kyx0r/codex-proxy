@@ -1310,8 +1310,9 @@ static void complete_anthropic(int fd, const char *path, cJSON *chat, cJSON **au
 	stream = cJSON_IsTrue(get(chat, "stream"));
 	if (!budget)
 		budget = effort_budget(reasoning_effort);
+	/* One ceiling covers thinking and the answer; keep the answer room. */
 	if (!item && chat_api) {
-		number = budget >= 1024 ? (double)budget + 2048 : 8000;
+		number = budget + 2048 < 32000 ? 32000.0 : (double)budget + 2048;
 		cJSON_AddNumberToObject(chat, "max_tokens", number);
 	}
 	if (budget && number && number <= (double)budget + 1024)
